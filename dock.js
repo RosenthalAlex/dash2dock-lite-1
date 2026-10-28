@@ -30,6 +30,9 @@ import {
 
 const Point = Graphene.Point;
 
+/// Desktop file id of a pinned item that opens the application grid.
+export const APP_LAUNCHER_ID = 'app-launcher.desktop';
+
 export const DockPosition = {
   BOTTOM: 'bottom',
   LEFT: 'left',
@@ -286,6 +289,15 @@ export let Dock = GObject.registerClass(
       if (!target) return false;
       let showAppsIcon = Compat.getDashShowAppsIcon(this.dash);
       if (showAppsIcon && target === showAppsIcon) {
+        Compat.showOverviewApps(Main.overview);
+        return true;
+      }
+      // a pinned "app-launcher.desktop" stands for the show-apps button, so that it can be
+      // placed anywhere among the favorites (e.g. right after the file manager)
+      if (
+        target._appwell &&
+        Compat.getAppId(target._appwell) === APP_LAUNCHER_ID
+      ) {
         Compat.showOverviewApps(Main.overview);
         return true;
       }

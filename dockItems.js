@@ -295,6 +295,16 @@ export const DockIcon = GObject.registerClass(
       }
     }
 
+    activate(button) {
+      // see APP_LAUNCHER_ID in dock.js
+      if (this.app?.get_id() === 'app-launcher.desktop') {
+        if (Main.overview.visible) Main.overview.hide();
+        else Main.overview.showApps();
+        return;
+      }
+      super.activate(button);
+    }
+
     _createIcon(size) {
       this._iconActor = new St.Icon({
         name: 'd2daDockIconActor',
