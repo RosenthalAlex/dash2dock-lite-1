@@ -854,6 +854,18 @@ export let Dock = GObject.registerClass(
       this._needsLayout = true;
     }
 
+    /// The dock icon of the application that owns a window, or null.
+    findIconForWindow(meta_window) {
+      let app = Shell.WindowTracker.get_default().get_window_app(meta_window);
+      if (!app) return null;
+      let id = app.get_id();
+      return (
+        this._findIcons().find(
+          (icon) => icon._appwell && Compat.getAppId(icon._appwell) === id
+        ) ?? null
+      );
+    }
+
     _findIcons() {
       if (!this.dash) {
         this._icons = null;

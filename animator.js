@@ -57,6 +57,21 @@ function getScale(u, xm, R, M, type = 0) {
     return 1.0 + (M - 1.0) * factor;
 }
 
+/// Translation keeping a swollen icon anchored to the edge the dock is attached to.
+function pulseOffset(position, grow) {
+  switch (position) {
+    case DockPosition.BOTTOM:
+      return [-grow / 2, -grow];
+    case DockPosition.TOP:
+      return [-grow / 2, 0];
+    case DockPosition.LEFT:
+      return [0, -grow / 2];
+    case DockPosition.RIGHT:
+      return [-grow, -grow / 2];
+  }
+  return [-grow / 2, -grow / 2];
+}
+
 export let Animator = class {
   constructor() {
     live('animator', 1);
@@ -184,6 +199,7 @@ export let Animator = class {
   _animate(dt) {
     let dock = this.dock;
     if (!dock) return;
+    this._lastAnimateTime = Date.now();
 
     if (dock._hoveredIcon) {
       dock._lastHoveredIcon = dock._hoveredIcon;
@@ -776,7 +792,9 @@ export let Animator = class {
         let unscaledIconSize =
           dock._iconSizeScaledDown * scaleFactor * innerScale;
         let targetSize = unscaledIconSize * icon._targetScale;
-        let currentSize = renderer.icon_size * renderer.scaleX;
+        // the pulse is not part of the size being animated
+        let currentSize =
+          (renderer.icon_size * renderer.scaleX) / (icon._appliedPulse || 1);
         {
           let dst = targetSize - currentSize;
           let mag = Math.abs(dst);
@@ -802,7 +820,18 @@ export let Animator = class {
           renderer.set_icon_size(baseSize);
         }
         let scaleToTarget = targetSize / baseSize;
+        // swallow/pour animation of a window minimizing into this icon
+        icon._appliedPulse = icon._pulse || 1;
+        scaleToTarget *= icon._appliedPulse;
         renderer.set_scale(scaleToTarget, scaleToTarget);
+        if (icon._appliedPulse !== 1 && !icon._appwell?._bounce) {
+          let [tx, ty] = pulseOffset(
+            dock._position,
+            targetSize * (icon._appliedPulse - 1)
+          );
+          renderer.translationX = tx;
+          renderer.translationY = ty;
+        }
 
         let p = icon.get_transformed_position();
         let adjustX = icon.width / 2 - targetSize / 2;
@@ -1239,6 +1268,52 @@ export let Animator = class {
 
     icon._label.x = Math.round(lx);
     icon._label.y = Math.round(ly);
+  }
+
+  /// Makes the dock icon of a window swell and settle back, as if swallowing the window
+  /// (minimize) or pouring it out (unminimize). Synchronized with the magic lamp effect.
+  pulseIcon(meta_window, { delay = 0, duration = 320, amount = 0.14 } = {}) {
+    let dock = this.dock;
+    let base = null;
+
+    const apply = (p) => {
+      if (!this._target || dock._dragging) return;
+      let icon = dock.findIconForWindow(meta_window);
+      let renderer = icon?._renderer;
+      if (!renderer) return;
+
+      // while the main loop runs it applies icon._pulse itself
+      let mainLoopActive = Date.now() - (this._lastAnimateTime || 0) < 60;
+      let applied = icon._appliedPulse || 1;
+      if (base === null) base = renderer.scaleX / applied;
+      let baseScale = mainLoopActive ? renderer.scaleX / applied : base;
+      icon._pulse = p;
+      if (!mainLoopActive) {
+        renderer.set_scale(baseScale * p, baseScale * p);
+        icon._appliedPulse = p;
+      }
+
+      // grow from the edge the dock is attached to (the main loop does it itself)
+      if (!mainLoopActive) {
+        let [tx, ty] = pulseOffset(
+          dock._position,
+          renderer.width * baseScale * (p - 1)
+        );
+        renderer.translationX = tx;
+        renderer.translationY = ty;
+      }
+    };
+
+    const bump = (f) => {
+      let t = Math.min(1, f._time / f._duration);
+      apply(t >= 0.98 ? 1 : 1 + amount * Math.sin(Math.PI * t));
+    };
+
+    let frames = [];
+    if (delay > 0) frames.push({ _duration: delay, _func: () => {} });
+    frames.push({ _duration: duration, _func: bump });
+    frames.push({ _duration: 60, _func: () => apply(1) });
+    dock.extension._hiTimer.runAnimation(frames);
   }
 
   bounceIcon(appwell) {
