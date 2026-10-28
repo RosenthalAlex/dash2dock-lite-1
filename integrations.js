@@ -132,20 +132,31 @@ export const Integrations = class {
       height: h * body,
     };
 
-    // the lamp picks its direction from the screen edge the rect touches: a magnified
-    // (raised) icon is too far from the edge, so stick the rect to the dock's edge
+    // the lamp picks its direction from the screen edge the rect touches, and a magnified
+    // (raised) icon is too far from it: extend the rect to the dock's screen edge, and give
+    // the icon's outer edge as `clip` so the window stops in the icon instead of the edge
+    let mx = monitor.x;
+    let my = monitor.y;
+    let mw = monitor.width;
+    let mh = monitor.height;
     switch (dock._position) {
       case 'bottom':
-        rect.y = monitor.y + monitor.height - rect.height;
+        rect.clip = rect.y + rect.height;
+        rect.height = my + mh - rect.y;
         break;
       case 'top':
-        rect.y = monitor.y;
+        rect.clip = rect.y;
+        rect.height = rect.y + rect.height - my;
+        rect.y = my;
         break;
       case 'left':
-        rect.x = monitor.x;
+        rect.clip = rect.x;
+        rect.width = rect.x + rect.width - mx;
+        rect.x = mx;
         break;
       case 'right':
-        rect.x = monitor.x + monitor.width - rect.width;
+        rect.clip = rect.x + rect.width;
+        rect.width = mx + mw - rect.x;
         break;
     }
     return rect;
