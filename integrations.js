@@ -125,12 +125,30 @@ export const Integrations = class {
 
     // macOS-style icons draw their body on ~80% of the canvas
     let body = 0.8;
-    return {
+    let rect = {
       x: x + (w * (1 - body)) / 2,
       y: y + (h * (1 - body)) / 2,
       width: w * body,
       height: h * body,
     };
+
+    // the lamp picks its direction from the screen edge the rect touches: a magnified
+    // (raised) icon is too far from the edge, so stick the rect to the dock's edge
+    switch (dock._position) {
+      case 'bottom':
+        rect.y = monitor.y + monitor.height - rect.height;
+        break;
+      case 'top':
+        rect.y = monitor.y;
+        break;
+      case 'left':
+        rect.x = monitor.x;
+        break;
+      case 'right':
+        rect.x = monitor.x + monitor.width - rect.width;
+        break;
+    }
+    return rect;
   }
 
   hookBms(hook = true) {
