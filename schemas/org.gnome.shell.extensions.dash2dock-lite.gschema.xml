@@ -26,6 +26,11 @@
         <summary>Shrink icons</summary>
         <description>Shrink dash icons.</description>
     </key>
+    <key type="d" name="inner-icon-scale">
+        <default>0.8</default>
+        <summary>Inner icon scale</summary>
+        <description>Ratio of icon size to dock cell size (e.g. 0.8 for smaller icons with padding).</description>
+    </key>
     <key type="b" name="animate-icons">
         <default>true</default>
         <summary>Animations and Effects</summary>

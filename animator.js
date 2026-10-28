@@ -769,7 +769,12 @@ export let Animator = class {
         //-------------------
         // animate scaling at renderer
         //-------------------
-        let unscaledIconSize = dock._iconSizeScaledDown * scaleFactor;
+        let innerScale =
+          dock.extension._config?.inner_icon_scale ??
+          dock.extension.inner_icon_scale ??
+          0.8;
+        let unscaledIconSize =
+          dock._iconSizeScaledDown * scaleFactor * innerScale;
         let targetSize = unscaledIconSize * icon._targetScale;
         let currentSize = renderer.icon_size * renderer.scaleX;
         {

@@ -122,6 +122,7 @@ const REACTIONS = Object.freeze({
   'dock-padding': ['layout', 'animate'],
   'edge-distance': ['layout', 'animate'],
   'shrink-icons': ['shrink', 'layout', 'animate'],
+  'inner-icon-scale': ['layout', 'animate'],
   'border-radius': ['debounced_style', 'animate'],
   'separator-thickness': ['style', 'recreate_docks', 'animate_preview'],
   'icon-border-color': ['style', 'layout', 'animate'],
@@ -503,6 +504,16 @@ export default class Dash2DockLiteExt extends Extension {
           speed_up = 0.5;
         }
         this._config.speed_up = speed_up;
+      }
+
+      {
+        let inner_icon_scale = this._config['inner-icon-scale'] ?? null;
+        if (typeof inner_icon_scale == 'string') {
+          inner_icon_scale = parseFloat(inner_icon_scale);
+        }
+        if (inner_icon_scale !== null && inner_icon_scale > 0 && inner_icon_scale <= 1) {
+          this._config.inner_icon_scale = inner_icon_scale;
+        }
       }
     }
 

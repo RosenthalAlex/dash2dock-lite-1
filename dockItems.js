@@ -168,8 +168,14 @@ export const DockItemDotsOverlay = GObject.registerClass(
       let renderer = this.renderer;
       let { appCount, position, vertical, extension, dock } = data;
 
-      renderer.width = dock._iconSizeScaledDown || icon._icon.width;
-      renderer.height = dock._iconSizeScaledDown || icon._icon.height;
+      let innerScale =
+        extension._config?.inner_icon_scale ??
+        extension.inner_icon_scale ??
+        0.8;
+      let baseIconSize =
+        (dock._iconSizeScaledDown || icon._icon.width) * innerScale;
+      renderer.width = baseIconSize;
+      renderer.height = baseIconSize;
       renderer.pivot_point = icon._icon.pivot_point;
 
       let canvasScale = renderer.width / renderer._canvas.width;
@@ -234,7 +240,12 @@ export const DockItemBadgeOverlay = GObject.registerClass(
       let renderer = this.renderer;
       let { noticesCount, position, vertical, extension, dock } = data;
 
-      let baseIconSize = dock._iconSizeScaledDown || icon._icon.width;
+      let innerScale =
+        extension._config?.inner_icon_scale ??
+        extension.inner_icon_scale ??
+        0.8;
+      let baseIconSize =
+        (dock._iconSizeScaledDown || icon._icon.width) * innerScale;
       renderer.width = baseIconSize;
       renderer.height = baseIconSize;
       renderer.pivot_point = icon._icon.pivot_point;
