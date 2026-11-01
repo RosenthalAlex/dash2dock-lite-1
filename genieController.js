@@ -64,6 +64,12 @@ export const GenieController = class {
     if (this._origShouldAnimate) Main.wm._shouldAnimateActor = this._origShouldAnimate;
   }
 
+  /// Whether a genie is running for this window.
+  isRunning(meta_window) {
+    const actor = meta_window?.get_compositor_private?.();
+    return Boolean(actor && this._running.has(actor));
+  }
+
   _duration() {
     return Math.max(150, this.extension.genie_duration || 420);
   }
@@ -167,12 +173,18 @@ export const GenieController = class {
 
   _onMinimize(actor) {
     if (!this.enabled || !actor?.meta_window) return;
-    if (!this._start(actor, true)) this._origCompletedMinimize.call(Main.wm._shellwm, actor);
+    if (this._start(actor, true)) return;
+    this._origCompletedMinimize.call(Main.wm._shellwm, actor);
+    // no genie (e.g. in the overview): the tile shows the window at once
+    this.extension.minimizedTiles?.landed(actor.meta_window);
   }
 
   _onUnminimize(actor) {
     if (!this.enabled || !actor?.meta_window) return;
     actor.show();
-    if (!this._start(actor, false)) this._origCompletedUnminimize.call(Main.wm._shellwm, actor);
+    if (this._start(actor, false)) return;
+    this._origCompletedUnminimize.call(Main.wm._shellwm, actor);
+    // no genie (e.g. restored from the overview): the tile goes now
+    this.extension.minimizedTiles?.restored(actor.meta_window);
   }
 };

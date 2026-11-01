@@ -21,6 +21,10 @@ const PICTURE_RATIO = 0.9;
 const THUMB_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'd2da', 'minimized']);
 // the tile is removed a little after unminimizing, once the magic lamp has read its position
 const REMOVE_DELAY_MS = 60;
+// how long after a window's minimized state changes the tiles check that they follow it: by then
+// the Shell's (un)minimize signal and the genie have started, if there is one at all (there is none
+// in the overview, or for a window on another workspace)
+const SETTLE_MS = 300;
 
 function popIn(badge) {
   if (!badge) return;
@@ -52,6 +56,8 @@ export const MinimizedTiles = class {
     this.entries = new Map();
     this._order = 0;
     this._signals = [];
+    this._windowSignals = new Map(); // meta window -> signal ids
+    this._timeouts = new Set();
   }
 
   get enabled() {
@@ -71,15 +77,67 @@ export const MinimizedTiles = class {
     this._signals.push([wm, wm.connect('minimize', (_, actor) => this._onMinimize(actor))]);
     this._signals.push([wm, wm.connect('unminimize', (_, actor) => this._onUnminimize(actor))]);
 
+    // the minimized state itself is followed too: the Shell does not always signal it
+    this._signals.push([
+      global.display,
+      global.display.connect('window-created', (_, w) => this._watch(w)),
+    ]);
+
     // windows already minimized, e.g. after a logout of the extension
     global.display.list_all_windows().forEach((w) => {
+      this._watch(w);
       if (w.minimized && this._accepts(w)) this._add(w, true);
     });
+  }
+
+  _watch(meta_window) {
+    if (this._windowSignals.has(meta_window)) return;
+    this._windowSignals.set(meta_window, [
+      meta_window.connect('notify::minimized', () => this._settleLater(meta_window)),
+      meta_window.connect('unmanaged', () => this._unwatch(meta_window)),
+    ]);
+  }
+
+  _unwatch(meta_window) {
+    const ids = this._windowSignals.get(meta_window);
+    if (!ids) return;
+    this._windowSignals.delete(meta_window);
+    ids.forEach((id) => {
+      try {
+        meta_window.disconnect(id);
+      } catch {
+        // window already gone
+      }
+    });
+  }
+
+  _settleLater(meta_window) {
+    const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => {
+      this._timeouts.delete(id);
+      if (this._windowSignals.has(meta_window)) this._settle(meta_window);
+      return GLib.SOURCE_REMOVE;
+    });
+    this._timeouts.add(id);
+  }
+
+  /// Makes the tiles match the window's minimized state when no animation took care of it: a
+  /// window restored from the overview or on another workspace must not leave its tile behind.
+  _settle(meta_window) {
+    const running = this.extension.genieController?.isRunning?.(meta_window);
+    if (meta_window.minimized) {
+      if (!this.entries.has(meta_window) && this._accepts(meta_window)) this._add(meta_window, true);
+      else if (!running) this.reveal(meta_window, 1);
+    } else if (this.entries.has(meta_window) && !running) {
+      this._forget(meta_window);
+    }
   }
 
   disable() {
     this._signals.forEach(([obj, id]) => obj.disconnect(id));
     this._signals = [];
+    this._timeouts.forEach((id) => GLib.source_remove(id));
+    this._timeouts.clear();
+    [...this._windowSignals.keys()].forEach((w) => this._unwatch(w));
     [...this.entries.keys()].forEach((w) => this._forget(w));
     this._clearThumbnails();
   }
