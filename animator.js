@@ -1087,7 +1087,8 @@ export let Animator = class {
       // size and visibility do not depend on the neighbours, so a separator
       // missing one never keeps a stale size or stays hidden
       let thickness = sepThickness;
-      let length = Math.round(iconSize * 0.6 * scaleFactor);
+      // as tall as the drawn icons, like on macOS
+      let length = Math.round(ICON_SIZE * innerScale);
       if (vertical) {
         actor.width = length;
         actor.height = thickness;
