@@ -1378,8 +1378,10 @@ export let Dock = GObject.registerClass(
       }
 
       let itemSize = Math.floor(iconSizeSpaced * scaleFactor);
+      this._itemSize = itemSize;
       this._icons.forEach((icon) => {
-        icon.width = itemSize;
+        // a slot opening or closing (minimized window tiles) is narrower
+        icon.width = itemSize * (icon._slotFactor ?? 1);
         icon.height = itemSize;
         if (icon.style != iconStyle) {
           icon.style = iconStyle;

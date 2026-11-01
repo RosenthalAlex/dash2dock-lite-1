@@ -88,12 +88,33 @@ export const GenieController = class {
     };
   }
 
+  /// The middle of a tile's slot, while it opens or closes: an icon-sized rect in the row of the
+  /// dock's icons, so that the target glides along with the slot.
+  _slotRect(dock, tile) {
+    if (!tile || !tile.get_stage() || !tile.has_allocation()) return null;
+    const reference = (tile._renderer?.visible && tile._renderer) || dock._trashIcon?._renderer;
+    if (!reference?.visible) return null;
+    const [, ry] = reference.get_transformed_position();
+    const [rw, rh] = reference.get_transformed_size();
+    const [tx, ty] = tile.get_transformed_position();
+    const [tw, th] = tile.get_transformed_size();
+    if (isNaN(tx) || isNaN(ry) || !rw) return null;
+    const vertical = dock.isVertical?.();
+    const x = vertical ? reference.get_transformed_position()[0] : tx + tw / 2 - rw / 2;
+    const y = vertical ? ty + th / 2 - rh / 2 : ry;
+    return {
+      x: x + (rw * (1 - ICON_BODY)) / 2,
+      y: y + (rh * (1 - ICON_BODY)) / 2,
+      width: rw * ICON_BODY,
+      height: rh * ICON_BODY,
+    };
+  }
+
   _target(dock, meta_window) {
     const tiles = this.extension.minimizedTiles;
     if (tiles?.enabled) {
       const tile = tiles.tileFor(dock, meta_window);
-      // a tile made just now is not drawn yet: it takes the trash's place
-      const rect = (tile?._renderer?.visible && this._rectOf(tile)) || this._rectOf(dock._trashIcon);
+      const rect = this._slotRect(dock, tile) || this._rectOf(dock._trashIcon);
       if (rect) return rect;
     }
     const icon = dock.findIconForWindow(meta_window);

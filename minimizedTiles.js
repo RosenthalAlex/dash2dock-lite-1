@@ -3,6 +3,7 @@ import Gio from 'gi://Gio';
 import GioUnix from 'gi://GioUnix';
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Clutter from 'gi://Clutter';
+import Graphene from 'gi://Graphene';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -20,6 +21,29 @@ const PICTURE_RATIO = 0.9;
 const THUMB_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'd2da', 'minimized']);
 // the tile is removed a little after unminimizing, once the magic lamp has read its position
 const REMOVE_DELAY_MS = 60;
+
+function popIn(badge) {
+  if (!badge) return;
+  badge.remove_all_transitions();
+  badge.set_scale(0.2, 0.2);
+  badge.opacity = 0;
+  badge.ease({
+    scale_x: 1.18, scale_y: 1.18, opacity: 255, duration: 170,
+    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+    onComplete: () => badge.ease({
+      scale_x: 1, scale_y: 1, duration: 150, mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD,
+    }),
+  });
+}
+
+function popOut(badge) {
+  if (!badge) return;
+  badge.remove_all_transitions();
+  badge.ease({
+    scale_x: 0.2, scale_y: 0.2, opacity: 0, duration: 200,
+    mode: Clutter.AnimationMode.EASE_IN_QUAD,
+  });
+}
 
 export const MinimizedTiles = class {
   constructor(extension) {
@@ -84,9 +108,10 @@ export const MinimizedTiles = class {
     });
   }
 
-  /// The genie has put the window into its tile.
+  /// The genie has put the window into its tile: the picture is in, the app icon pops in.
   landed(meta_window) {
     this.reveal(meta_window, 1);
+    this._eachOverlay(meta_window, (overlay) => popIn(overlay._badge));
   }
 
   /// The genie has brought the window back out of its tile.
@@ -94,9 +119,14 @@ export const MinimizedTiles = class {
     if (!meta_window.minimized) this._forget(meta_window);
   }
 
-  /// The window pours out of its tile: the tile empties at once.
+  /// The window pours out of its tile: the picture goes and the app icon shrinks away.
   emptyTile(dock, meta_window) {
-    this.reveal(meta_window, 0);
+    const entry = this.entries.get(meta_window);
+    if (entry) entry.reveal = 0;
+    this._eachOverlay(meta_window, (overlay) => {
+      overlay._picture?.ease({ opacity: 0, duration: 150, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+      popOut(overlay._badge);
+    });
   }
 
   /// How much of the window's picture shows in its tile (0..1).
@@ -104,9 +134,18 @@ export const MinimizedTiles = class {
     const entry = this.entries.get(meta_window);
     if (!entry) return;
     entry.reveal = amount;
+    this._eachOverlay(meta_window, (overlay) => {
+      if (overlay._picture) {
+        overlay._picture.remove_all_transitions();
+        overlay._picture.opacity = Math.round(255 * amount);
+      }
+    });
+  }
+
+  _eachOverlay(meta_window, fn) {
     (this.extension.docks || []).forEach((dock) => {
       const overlay = this.tileFor(dock, meta_window)?._overlay;
-      if (overlay) overlay.opacity = Math.round(255 * amount);
+      if (overlay) fn(overlay);
     });
   }
 
@@ -168,12 +207,9 @@ export const MinimizedTiles = class {
     const wanted = new Set(windows.map(([w]) => w));
 
     dock._minimizedTiles.forEach((tile) => {
-      if (!wanted.has(tile._minimizedWindow)) {
-        tile._d2daDestroyed = true;
-        tile.destroy();
-      }
+      if (!wanted.has(tile._minimizedWindow)) this._closeTile(dock, tile);
     });
-    dock._minimizedTiles = dock._minimizedTiles.filter((t) => !t._d2daDestroyed);
+    dock._minimizedTiles = dock._minimizedTiles.filter((t) => !t._d2daDestroyed && !t._closing);
 
     windows.forEach(([w, entry]) => {
       let tile = this.tileFor(dock, w);
@@ -230,15 +266,25 @@ export const MinimizedTiles = class {
     }
 
     const overlay = this._createOverlay(meta_window, app);
-    overlay.opacity = Math.round(255 * (entry.reveal ?? 1));
+    const revealed = (entry.reveal ?? 1) > 0;
+    if (overlay._picture) overlay._picture.opacity = revealed ? 255 : 0;
+    if (!revealed) {
+      overlay._badge.opacity = 0;
+      overlay._badge.set_scale(0, 0);
+    }
+    // the dock makes room for the tile, like the macOS Dock, instead of the trash jumping aside
+    if (!revealed) this._animateSlot(dock, tile, 0, 1, this._openDuration());
     dock.renderArea?.add_child(overlay);
     tile._overlay = overlay;
     // called by the animator each time it places the tile's renderer
     tile._followRenderer = (renderer) => this._placeOverlay(overlay, renderer, meta_window);
+    // the overlay can go first, with the dock's render area (e.g. when the dock is rebuilt)
+    overlay.connect('destroy', () => (overlay._gone = true));
     tile.connect('destroy', () => {
       tile._d2daDestroyed = true;
       tile._followRenderer = null;
-      overlay.destroy();
+      tile._slotTimeline?.stop();
+      if (!overlay._gone) overlay.destroy();
     });
 
     tile._onClick = () => {
@@ -246,6 +292,51 @@ export const MinimizedTiles = class {
       meta_window.activate(global.get_current_time());
     };
     return tile;
+  }
+
+  _openDuration() {
+    return Math.max(200, (this.extension.genie_duration || 400) * 0.85);
+  }
+
+  /// Animates the width of a tile's slot in the dock (0 = closed, 1 = open).
+  _animateSlot(dock, tile, from, to, duration, onDone) {
+    tile._slotTimeline?.stop();
+    tile._slotFactor = from;
+    const timeline = new Clutter.Timeline({ actor: tile, duration });
+    tile._slotTimeline = timeline;
+    const apply = () => {
+      if (tile._d2daDestroyed) return;
+      const t = timeline.get_progress();
+      const e = 1 - (1 - t) * (1 - t) * (1 - t); // ease out
+      tile._slotFactor = from + (to - from) * e;
+      if (dock._itemSize) tile.width = dock._itemSize * tile._slotFactor;
+      dock._beginAnimation?.();
+    };
+    timeline.connect('new-frame', apply);
+    timeline.connect('completed', () => {
+      tile._slotTimeline = null;
+      tile._slotFactor = to === 1 ? undefined : to;
+      if (dock._itemSize) tile.width = dock._itemSize * (tile._slotFactor ?? 1);
+      dock._beginAnimation?.();
+      onDone?.();
+    });
+    apply();
+    timeline.start();
+  }
+
+  /// The tile's window is back: its slot closes, then it goes.
+  _closeTile(dock, tile) {
+    if (tile._closing || tile._d2daDestroyed) return;
+    tile._closing = true;
+    tile._overlay?.hide();
+    this._animateSlot(dock, tile, tile._slotFactor ?? 1, 0, 260, () => {
+      if (tile._d2daDestroyed) return;
+      tile._d2daDestroyed = true;
+      tile.destroy();
+      dock._icons = null;
+      dock._needsLayout = true;
+      dock._beginAnimation?.();
+    });
   }
 
   /// The live picture of a window with its app icon in the corner, drawn over its tile.
@@ -256,8 +347,15 @@ export const MinimizedTiles = class {
       overlay._picture = new Clutter.Clone({ source: windowActor });
       overlay.add_child(overlay._picture);
     }
-    overlay._badge = new St.Icon({ gicon: this._appGicon(app), icon_size: BADGE_ICON_SIZE });
-    overlay.add_child(overlay._badge);
+    // the box follows the tile; the icon inside it has its own pop in / out animation
+    overlay._badgeBox = new St.Widget({ layout_manager: new Clutter.FixedLayout() });
+    overlay._badge = new St.Icon({
+      gicon: this._appGicon(app),
+      icon_size: BADGE_ICON_SIZE,
+      pivot_point: new Graphene.Point({ x: 0.5, y: 0.5 }),
+    });
+    overlay._badgeBox.add_child(overlay._badge);
+    overlay.add_child(overlay._badgeBox);
     overlay.hide(); // until the animator first places it
     return overlay;
   }
@@ -290,10 +388,10 @@ export const MinimizedTiles = class {
     }
 
     // loaded once at a fixed size and scaled: changing icon_size would reload it every frame
-    const badge = overlay._badge;
+    const box = overlay._badgeBox;
     const bs = size * BADGE_RATIO;
-    badge.set_position(size - bs, size - bs);
-    badge.set_scale(bs / BADGE_ICON_SIZE, bs / BADGE_ICON_SIZE);
+    box.set_position(size - bs, size - bs);
+    box.set_scale(bs / BADGE_ICON_SIZE, bs / BADGE_ICON_SIZE);
   }
 
   /// The app icon as shown in the dock (honouring the dock's icon overrides).
