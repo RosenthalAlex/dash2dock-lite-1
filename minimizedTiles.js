@@ -39,7 +39,7 @@ export const MinimizedTiles = class {
 
     // windows already minimized, e.g. after a logout of the extension
     global.display.list_all_windows().forEach((w) => {
-      if (w.minimized && this._accepts(w)) this._add(w);
+      if (w.minimized && this._accepts(w)) this._add(w, true);
     });
   }
 
@@ -72,7 +72,7 @@ export const MinimizedTiles = class {
     });
   }
 
-  _add(meta_window) {
+  _add(meta_window, already_hidden = false) {
     if (this.entries.has(meta_window)) return;
     const entry = { thumbnail: null, order: ++this._order, signals: [] };
     this.entries.set(meta_window, entry);
@@ -81,8 +81,15 @@ export const MinimizedTiles = class {
       meta_window.connect('notify::title', () => this._refreshDocks())
     );
 
-    // the thumbnail is made from the window's own texture, before the minimize effect hides it
-    this._makeThumbnail(meta_window)
+    // the window is painted now, before the minimize effect hides it, but the slow part (reading
+    // it back, scaling, saving) waits for the end of the magic lamp so that it does not stutter
+    const snapshot = this._snapshot(meta_window, already_hidden);
+    const delay = this._lampDuration() + 150;
+    new Promise((resolve) => GLib.timeout_add(GLib.PRIORITY_LOW, delay, () => {
+      resolve();
+      return GLib.SOURCE_REMOVE;
+    }))
+      .then(() => (this.entries.has(meta_window) ? this._makeThumbnail(meta_window, snapshot) : null))
       .then((path) => {
         if (!this.entries.has(meta_window)) {
           if (path) GLib.unlink(path);
@@ -156,11 +163,16 @@ export const MinimizedTiles = class {
     windows.forEach(([w, entry]) => {
       let tile = this.tileFor(dock, w);
       const label = w.get_title() || '';
-      if (tile && (tile._thumbnail !== entry.thumbnail || tile._title !== label)) {
-        tile._d2daDestroyed = true;
-        tile.destroy();
-        dock._minimizedTiles = dock._minimizedTiles.filter((t) => t !== tile);
-        tile = null;
+      // a new thumbnail or title updates the tile in place: no relayout of the dock
+      if (tile && tile._thumbnail !== entry.thumbnail && entry.thumbnail) {
+        const gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(entry.thumbnail) });
+        tile.child._default_gicon = gicon;
+        if (tile.child._iconActor) tile.child._iconActor.gicon = gicon;
+        tile._thumbnail = entry.thumbnail;
+      }
+      if (tile && tile._title !== label) {
+        tile.setLabelText?.(label);
+        tile._title = label;
       }
       if (!tile) {
         tile = this._createTile(dock, w, entry, label);
@@ -218,17 +230,40 @@ export const MinimizedTiles = class {
     return tile;
   }
 
-  async _makeThumbnail(meta_window) {
+  _lampDuration() {
+    try {
+      return this.extension.integrations?._compiz?.settingsData?.DURATION?.get() ?? 250;
+    } catch {
+      return 250;
+    }
+  }
+
+  /// A GPU copy of the window, cheap to take, read back later.
+  _snapshot(meta_window, already_hidden = false) {
     const actor = meta_window.get_compositor_private();
     if (!actor) return null;
-    // the window's buffer, untouched by the minimize effect; a multi-plane (e.g. YUV) buffer
-    // or none at all falls back to painting the actor
-    let texture = null;
-    const multi = actor.get_texture?.()?.get_texture?.();
-    if (multi?.get_n_planes?.() === 1) texture = multi.get_plane(0);
-    else if (multi && !multi.get_n_planes) texture = multi;
-    if (!texture) texture = actor.paint_to_content(null)?.get_texture();
-    if (!texture) return null;
+    const frame = meta_window.get_frame_rect();
+    const buffer = meta_window.get_buffer_rect();
+    // the window's buffer itself (single-plane only); a hidden actor would paint nothing
+    const buffer_texture = () => {
+      const multi = actor.get_texture?.()?.get_texture?.();
+      return multi?.get_n_planes?.() === 1 ? multi.get_plane(0) : null;
+    };
+    let texture = already_hidden ? buffer_texture() : null;
+    if (!texture) {
+      try {
+        texture = actor.paint_to_content(null)?.get_texture() ?? null;
+      } catch {
+        texture = null;
+      }
+    }
+    texture ??= buffer_texture();
+    return texture ? { texture, frame, buffer } : null;
+  }
+
+  async _makeThumbnail(meta_window, snapshot) {
+    if (!snapshot) return null;
+    const { texture, frame, buffer } = snapshot;
 
     const stream = Gio.MemoryOutputStream.new_resizable();
     const shot = await new Promise((resolve, reject) => {
@@ -247,8 +282,6 @@ export const MinimizedTiles = class {
     if (!shot) return null;
 
     // only the window itself, without client-side shadows
-    const frame = meta_window.get_frame_rect();
-    const buffer = meta_window.get_buffer_rect();
     const scale = buffer.width ? shot.get_width() / buffer.width : 1;
     const cx = Math.max(0, Math.round((frame.x - buffer.x) * scale));
     const cy = Math.max(0, Math.round((frame.y - buffer.y) * scale));
