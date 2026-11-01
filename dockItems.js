@@ -292,7 +292,27 @@ export const DockIcon = GObject.registerClass(
           return Clutter.EVENT_STOP;
         };
         this._draggable._grabActor = () => {};
+        // GNOME 49+ starts drags with a gesture action that ignores `inhibit`: a drag begun on
+        // a dock item grabbed the pointer, then failed to make its drag actor and never let go,
+        // freezing the pointer. Dock items are not dragged: turn the gesture off.
+        const gesture = this._draggable._dndGesture;
+        if (gesture) {
+          gesture.enabled = false;
+          this.remove_action?.(gesture);
+        }
       }
+    }
+
+    // a safety net if a drag starts anyway: custom items (trash, folders, minimized windows) have
+    // no Shell app to make the drag actor from
+    getDragActor() {
+      if (typeof this.app?.create_icon_texture === 'function')
+        return super.getDragActor();
+      return new St.Icon({
+        gicon: this._default_gicon ?? null,
+        icon_name: this._default_gicon ? null : this._default_icon_name || 'file',
+        icon_size: this.iconSize ?? 48,
+      });
     }
 
     activate(button) {
