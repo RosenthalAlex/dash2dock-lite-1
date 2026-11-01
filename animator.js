@@ -881,6 +881,8 @@ export let Animator = class {
             // });
 
             renderer.visible = true;
+            // e.g. the live picture of a minimized window drawn over its tile
+            icon._followRenderer?.(renderer);
           }
           icon._px = p[0] - renderOffset[0];
           icon._py = p[1] - renderOffset[1];

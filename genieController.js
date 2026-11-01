@@ -122,6 +122,8 @@ export const GenieController = class {
       getTarget: () => this._target(dock, meta_window),
       minimize,
       duration: this._duration(),
+      // the window's picture appears in its tile as the window lands
+      onFrame: minimize ? (p) => tiles?.reveal(meta_window, Math.max(0, (p - 0.8) / 0.2)) : null,
       onDone: () => {
         this._running.delete(actor);
         if (minimize) {

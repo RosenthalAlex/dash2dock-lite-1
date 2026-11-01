@@ -9,6 +9,8 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const X_TILES = 16;
 const Y_TILES = 32;
+// how much earlier the rows nearest the dock set off
+const LEAD = 1.4;
 
 function clamp01(v) {
   return v < 0 ? 0 : v > 1 ? 1 : v;
@@ -62,46 +64,49 @@ export const GenieEffect = GObject.registerClass(
       this.set_n_tiles(X_TILES, Y_TILES);
     }
 
-    /// p: 0 = window, 1 = inside the target.
+    /// p: 0 = window, 1 = inside the target. Everything that does not depend on the vertex is
+    /// computed here, once per frame: deform_vertex runs for every vertex of the mesh.
     setProgress(p) {
       // the funnel forms first, then the window pours into it
       this._k = ease(p / 0.35);
       this._j = clamp01((p - 0.08) / 0.92);
       const target = this._getTarget?.();
       if (target) this._target = target;
+      if (this._target) {
+        // the clone sits exactly where the window was, so its origin is the source's
+        this._W = rectToFrame(this._frame, this._source);
+        this._T = rectToFrame(this._frame, this._target);
+        this._reach = this._T.b0 - this._W.b0 || 1;
+      }
       this.invalidate();
     }
 
     vfunc_deform_vertex(width, height, v) {
-      const actor = this.get_actor();
-      if (!actor || !this._target) return;
+      const W = this._W;
+      const T = this._T;
+      if (!W || !T) return;
 
-      const frame = this._frame;
-      const [ax, ay] = actor.get_transformed_position();
-      const W = rectToFrame(frame, this._source);
-      const T = rectToFrame(frame, this._target);
-
-      // the vertex in the dock frame, as a fraction of the window (u along, v toward the dock)
-      const [pa, pb] = frame.to(ax + v.tx * width, ay + v.ty * height);
-      const u = (pa - W.a0) / (W.a1 - W.a0 || 1);
-      const w = (pb - W.b0) / (W.b1 - W.b0 || 1);
+      // the vertex as a fraction of the window: u along the dock edge, w toward it
+      let u, w;
+      switch (this._position) {
+        case 'top': u = v.tx; w = 1 - v.ty; break;
+        case 'left': u = v.ty; w = 1 - v.tx; break;
+        case 'right': u = v.ty; w = v.tx; break;
+        default: u = v.tx; w = v.ty;
+      }
 
       // slide: each row travels from its place in the window to its place in the target, the
       // rows nearest the dock first, so that the window stretches into a tail and pours in
-      const LEAD = 1.4;
       const row = ease(this._j * (1 + LEAD) - LEAD * (1 - w));
       const b = lerp(W.b0 + w * (W.b1 - W.b0), T.b0 + w * (T.b1 - T.b0), row);
 
       // funnel: rows close to the target are squeezed to its width
-      const reach = T.b0 - W.b0 || 1;
-      const s = ease((b - W.b0) / reach) * this._k;
-      const left = lerp(W.a0, T.a0, s);
-      const right = lerp(W.a1, T.a1, s);
-      const a = lerp(left, right, u);
+      const s = ease((b - W.b0) / this._reach) * this._k;
+      const a = lerp(lerp(W.a0, T.a0, s), lerp(W.a1, T.a1, s), u);
 
-      const [sx, sy] = frame.from(a, b);
-      v.x = sx - ax;
-      v.y = sy - ay;
+      const [sx, sy] = this._frame.from(a, b);
+      v.x = sx - this._source.x;
+      v.y = sy - this._source.y;
     }
 
     vfunc_modify_paint_volume() {

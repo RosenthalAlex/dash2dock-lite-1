@@ -2,16 +2,21 @@ import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 import GioUnix from 'gi://GioUnix';
 import GdkPixbuf from 'gi://GdkPixbuf';
+import Clutter from 'gi://Clutter';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-// Like the macOS Dock: a minimized window becomes a small tile (its thumbnail with the app icon
-// in the corner) between the folders and the trash, the newest one next to the trash. Clicking
-// the tile restores the window.
+// Like the macOS Dock: a minimized window becomes a small tile (a live picture of the window with
+// the app icon in the corner) between the folders and the trash, the newest one next to the
+// trash. Clicking the tile restores the window.
+//
+// The picture is a clone of the window drawn over the tile's (empty) dock icon, following it
+// every frame: nothing is read back from the GPU, so minimizing does not stutter.
 
-const THUMB_SIZE = 256;
 const BADGE_RATIO = 0.42;
+const BADGE_ICON_SIZE = 96;
+const PICTURE_RATIO = 0.9;
 const THUMB_DIR = GLib.build_filenamev([GLib.get_user_cache_dir(), 'd2da', 'minimized']);
 // the tile is removed a little after unminimizing, once the magic lamp has read its position
 const REMOVE_DELAY_MS = 60;
@@ -19,7 +24,7 @@ const REMOVE_DELAY_MS = 60;
 export const MinimizedTiles = class {
   constructor(extension) {
     this.extension = extension;
-    // meta window -> { thumbnail: path | null, order: number }
+    // meta window -> { order: number, reveal: 0..1, signals }
     this.entries = new Map();
     this._order = 0;
     this._signals = [];
@@ -32,7 +37,7 @@ export const MinimizedTiles = class {
   enable() {
     GLib.mkdir_with_parents(THUMB_DIR, 0o755);
     this._clearThumbnails();
-    // an empty tile until the thumbnail is ready, rather than the app icon switching to it
+    // the tiles' dock icon is empty: the window's picture is drawn over it
     this._blank = GLib.build_filenamev([THUMB_DIR, 'blank.png']);
     const blank = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8, 8, 8);
     blank.fill(0x00000000);
@@ -79,9 +84,9 @@ export const MinimizedTiles = class {
     });
   }
 
-  /// The genie has put the window into its tile: time for its thumbnail.
+  /// The genie has put the window into its tile.
   landed(meta_window) {
-    this.entries.get(meta_window)?.land?.();
+    this.reveal(meta_window, 1);
   }
 
   /// The genie has brought the window back out of its tile.
@@ -91,47 +96,32 @@ export const MinimizedTiles = class {
 
   /// The window pours out of its tile: the tile empties at once.
   emptyTile(dock, meta_window) {
-    const tile = this.tileFor(dock, meta_window);
-    if (!tile?.child) return;
-    const gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(this._blank) });
-    tile.child._default_gicon = gicon;
-    if (tile.child._iconActor) tile.child._iconActor.gicon = gicon;
-    this.extension.animate?.({ refresh: true });
+    this.reveal(meta_window, 0);
+  }
+
+  /// How much of the window's picture shows in its tile (0..1).
+  reveal(meta_window, amount) {
+    const entry = this.entries.get(meta_window);
+    if (!entry) return;
+    entry.reveal = amount;
+    (this.extension.docks || []).forEach((dock) => {
+      const overlay = this.tileFor(dock, meta_window)?._overlay;
+      if (overlay) overlay.opacity = Math.round(255 * amount);
+    });
   }
 
   _add(meta_window, already_hidden = false) {
     if (this.entries.has(meta_window)) return;
-    const entry = { thumbnail: null, order: ++this._order, signals: [] };
+    const entry = { order: ++this._order, reveal: 1, signals: [] };
     this.entries.set(meta_window, entry);
     entry.signals.push(meta_window.connect('unmanaged', () => this._forget(meta_window)));
     entry.signals.push(
       meta_window.connect('notify::title', () => this._refreshDocks())
     );
 
-    // the window is painted now, before the minimize effect hides it, but the slow part (reading
-    // it back, scaling, saving) waits for the end of the magic lamp so that it does not stutter
-    const snapshot = this._snapshot(meta_window, already_hidden);
-    // ready when the window lands in its tile: told by the dock's genie, else after the lamp
-    new Promise((resolve) => {
-      if (this.extension.genieController?.enabled && !already_hidden) {
-        entry.land = resolve;
-      } else {
-        GLib.timeout_add(GLib.PRIORITY_LOW, already_hidden ? 0 : this._lampDuration(), () => {
-          resolve();
-          return GLib.SOURCE_REMOVE;
-        });
-      }
-    })
-      .then(() => (this.entries.has(meta_window) ? this._makeThumbnail(meta_window, snapshot) : null))
-      .then((path) => {
-        if (!this.entries.has(meta_window)) {
-          if (path) GLib.unlink(path);
-          return;
-        }
-        entry.thumbnail = path;
-        this._refreshDocks();
-      })
-      .catch((e) => console.error('d2da: minimized tile thumbnail', e));
+    // without the dock's genie (or for windows already minimized) the picture shows at once;
+    // the genie reveals it as the window lands
+    entry.reveal = this.extension.genieController?.enabled && !already_hidden ? 0 : 1;
 
     this._refreshDocks();
   }
@@ -148,14 +138,6 @@ export const MinimizedTiles = class {
     });
     this.entries.delete(meta_window);
     this._refreshDocks();
-    if (entry.thumbnail) {
-      // keep the file a moment: the icon may still be drawn while the tile goes away
-      const path = entry.thumbnail;
-      GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 5, () => {
-        GLib.unlink(path);
-        return GLib.SOURCE_REMOVE;
-      });
-    }
   }
 
   _refreshDocks() {
@@ -196,13 +178,7 @@ export const MinimizedTiles = class {
     windows.forEach(([w, entry]) => {
       let tile = this.tileFor(dock, w);
       const label = w.get_title() || '';
-      // a new thumbnail or title updates the tile in place: no relayout of the dock
-      if (tile && tile._thumbnail !== entry.thumbnail && entry.thumbnail) {
-        const gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(entry.thumbnail) });
-        tile.child._default_gicon = gicon;
-        if (tile.child._iconActor) tile.child._iconActor.gicon = gicon;
-        tile._thumbnail = entry.thumbnail;
-      }
+      // a new title updates the tile in place: no relayout of the dock
       if (tile && tile._title !== label) {
         tile.setLabelText?.(label);
         tile._title = label;
@@ -242,19 +218,28 @@ export const MinimizedTiles = class {
 
     const tile = dock.createItem(appInfo, `_minimized_${meta_window.get_stable_sequence()}`);
     tile._minimizedWindow = meta_window;
-    tile._thumbnail = entry.thumbnail;
     tile._title = label;
     tile._destroyMenu?.(); // an app menu makes no sense for a window
-    tile.connect('destroy', () => (tile._d2daDestroyed = true));
 
+    // the dock draws an empty icon; the window's picture is drawn over it
     const icon = tile.child;
-    const gicon = new Gio.FileIcon({
-      file: Gio.File.new_for_path(entry.thumbnail ?? this._blank),
-    });
-    if (icon && gicon) {
+    const gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(this._blank) });
+    if (icon) {
       icon._default_gicon = gicon;
       if (icon._iconActor) icon._iconActor.gicon = gicon;
     }
+
+    const overlay = this._createOverlay(meta_window, app);
+    overlay.opacity = Math.round(255 * (entry.reveal ?? 1));
+    dock.renderArea?.add_child(overlay);
+    tile._overlay = overlay;
+    // called by the animator each time it places the tile's renderer
+    tile._followRenderer = (renderer) => this._placeOverlay(overlay, renderer, meta_window);
+    tile.connect('destroy', () => {
+      tile._d2daDestroyed = true;
+      tile._followRenderer = null;
+      overlay.destroy();
+    });
 
     tile._onClick = () => {
       meta_window.unminimize();
@@ -263,109 +248,59 @@ export const MinimizedTiles = class {
     return tile;
   }
 
-  _lampDuration() {
-    try {
-      return this.extension.integrations?._compiz?.settingsData?.DURATION?.get() ?? 250;
-    } catch {
-      return 250;
+  /// The live picture of a window with its app icon in the corner, drawn over its tile.
+  _createOverlay(meta_window, app) {
+    const overlay = new St.Widget({ reactive: false, layout_manager: new Clutter.FixedLayout() });
+    const windowActor = meta_window.get_compositor_private();
+    if (windowActor) {
+      overlay._picture = new Clutter.Clone({ source: windowActor });
+      overlay.add_child(overlay._picture);
     }
+    overlay._badge = new St.Icon({ gicon: this._appGicon(app), icon_size: BADGE_ICON_SIZE });
+    overlay.add_child(overlay._badge);
+    overlay.hide(); // until the animator first places it
+    return overlay;
   }
 
-  /// A GPU copy of the window, cheap to take, read back later.
-  _snapshot(meta_window, already_hidden = false) {
-    const actor = meta_window.get_compositor_private();
-    if (!actor) return null;
-    const frame = meta_window.get_frame_rect();
-    const buffer = meta_window.get_buffer_rect();
-    // the window's buffer itself (single-plane only); a hidden actor would paint nothing
-    const buffer_texture = () => {
-      const multi = actor.get_texture?.()?.get_texture?.();
-      return multi?.get_n_planes?.() === 1 ? multi.get_plane(0) : null;
-    };
-    let texture = already_hidden ? buffer_texture() : null;
-    if (!texture) {
-      try {
-        texture = actor.paint_to_content(null)?.get_texture() ?? null;
-      } catch {
-        texture = null;
-      }
+  _placeOverlay(overlay, renderer, meta_window) {
+    if (!renderer?.visible) {
+      overlay.hide();
+      return;
     }
-    texture ??= buffer_texture();
-    return texture ? { texture, frame, buffer } : null;
-  }
+    overlay.show();
+    const size = renderer.width * renderer.scaleX;
+    overlay.set_position(renderer.x + renderer.translationX, renderer.y + renderer.translationY);
+    overlay.set_size(size, size);
 
-  async _makeThumbnail(meta_window, snapshot) {
-    if (!snapshot) return null;
-    const { texture, frame, buffer } = snapshot;
-
-    const stream = Gio.MemoryOutputStream.new_resizable();
-    const shot = await new Promise((resolve, reject) => {
-      Shell.Screenshot.composite_to_stream(
-        texture, 0, 0, -1, -1, 1, null, 0, 0, 1, stream,
-        (_, res) => {
-          try {
-            resolve(Shell.Screenshot.composite_to_stream_finish(res));
-          } catch (e) {
-            reject(e);
-          }
-        }
+    // the window, without its shadows, fitted in the tile
+    const picture = overlay._picture;
+    const windowActor = meta_window.get_compositor_private();
+    if (picture && windowActor) {
+      const frame = meta_window.get_frame_rect();
+      const buffer = meta_window.get_buffer_rect();
+      const fw = frame.width || windowActor.width;
+      const fh = frame.height || windowActor.height;
+      const fit = (size * PICTURE_RATIO) / Math.max(fw, fh, 1);
+      // the clone shows the whole buffer: scale it so that the frame part fits, and offset it
+      picture.set_size(buffer.width * fit, buffer.height * fit);
+      picture.set_position(
+        (size - fw * fit) / 2 - (frame.x - buffer.x) * fit,
+        (size - fh * fit) / 2 - (frame.y - buffer.y) * fit
       );
-    });
-    stream.close(null);
-    if (!shot) return null;
-
-    // only the window itself, without client-side shadows
-    const scale = buffer.width ? shot.get_width() / buffer.width : 1;
-    const cx = Math.max(0, Math.round((frame.x - buffer.x) * scale));
-    const cy = Math.max(0, Math.round((frame.y - buffer.y) * scale));
-    const cw = Math.min(shot.get_width() - cx, Math.round(frame.width * scale));
-    const ch = Math.min(shot.get_height() - cy, Math.round(frame.height * scale));
-    const win = cw > 0 && ch > 0 ? shot.new_subpixbuf(cx, cy, cw, ch) : shot;
-
-    const canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8, THUMB_SIZE, THUMB_SIZE);
-    canvas.fill(0x00000000);
-    const fit = (THUMB_SIZE * 0.9) / Math.max(win.get_width(), win.get_height());
-    const sw = Math.max(1, Math.round(win.get_width() * fit));
-    const sh = Math.max(1, Math.round(win.get_height() * fit));
-    const dx = Math.round((THUMB_SIZE - sw) / 2);
-    const dy = Math.round((THUMB_SIZE - sh) / 2);
-    win.composite(canvas, dx, dy, sw, sh, dx, dy, fit, fit, GdkPixbuf.InterpType.BILINEAR, 255);
-
-    const badge = this._appIconPixbuf(meta_window, Math.round(THUMB_SIZE * BADGE_RATIO));
-    if (badge) {
-      const bx = THUMB_SIZE - badge.get_width();
-      const by = THUMB_SIZE - badge.get_height();
-      badge.composite(canvas, bx, by, badge.get_width(), badge.get_height(),
-        bx, by, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255);
     }
 
-    const path = GLib.build_filenamev([
-      THUMB_DIR,
-      `${meta_window.get_stable_sequence()}-${GLib.get_monotonic_time()}.png`,
-    ]);
-    canvas.savev(path, 'png', [], []);
-    return path;
+    // loaded once at a fixed size and scaled: changing icon_size would reload it every frame
+    const badge = overlay._badge;
+    const bs = size * BADGE_RATIO;
+    badge.set_position(size - bs, size - bs);
+    badge.set_scale(bs / BADGE_ICON_SIZE, bs / BADGE_ICON_SIZE);
   }
 
   /// The app icon as shown in the dock (honouring the dock's icon overrides).
-  _appIconPixbuf(meta_window, size) {
-    const app = Shell.WindowTracker.get_default().get_window_app(meta_window);
+  _appGicon(app) {
     if (!app) return null;
-    let file = null;
     const appName = app.get_id()?.replace('.desktop', '');
-    const override = this.extension.app_map_cache?.[appName];
-    if (override?.get_file) file = override.get_file().get_path();
-    if (!file) {
-      const theme = this.extension.icon_theme ?? St.IconTheme.new();
-      const info = theme.lookup_by_gicon(app.get_icon(), size, St.IconLookupFlags.FORCE_SIZE);
-      file = info?.get_filename();
-    }
-    if (!file) return null;
-    try {
-      return GdkPixbuf.Pixbuf.new_from_file_at_size(file, size, size);
-    } catch {
-      return null;
-    }
+    return this.extension.app_map_cache?.[appName] ?? app.get_icon();
   }
 
   _clearThumbnails() {
