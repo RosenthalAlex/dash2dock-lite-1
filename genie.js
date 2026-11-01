@@ -1,7 +1,7 @@
 // Genie minimize/unminimize effect built into the dock, so that the window and the dock move as
 // one: the window flies above the dock into the live position of its target (a minimized-window
 // tile or the app icon), every frame. Inspired by the compiz-alike-magic-lamp-effect extension by
-// Mauro Pepe (GPL-2.0-or-later).
+// Mauro Pepe (GPL-3.0-or-later).
 
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
