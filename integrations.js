@@ -31,6 +31,8 @@ export const Integrations = class {
   // and when the window pours out of it again
   _pulseForLamp(actor, minimize) {
     if (!this._compiz || !this.extension.lamp_app_animation) return;
+    // with tiles the window does not go into its app icon
+    if (this.extension.minimize_to_tiles) return;
     if (Main.overview.visible) return;
     let meta_window = actor?.meta_window;
     if (!meta_window) return;
@@ -112,7 +114,16 @@ export const Integrations = class {
       return fallback;
     }
 
-    let renderer = dock.findIconForWindow(meta_window)?._renderer;
+    let renderer = null;
+    const tiles = this.extension.minimizedTiles;
+    if (tiles?.enabled) {
+      // the window goes into (or comes out of) its tile before the trash; a tile made just now
+      // is not drawn yet, but it takes the trash's place, which moves on
+      const tile = tiles.tileFor(dock, meta_window);
+      if (tile?._renderer?.visible) renderer = tile._renderer;
+      else if (meta_window.minimized) renderer = dock._trashIcon?._renderer;
+    }
+    renderer ??= dock.findIconForWindow(meta_window)?._renderer;
     if (!renderer || !renderer.visible) {
       return fallback;
     }

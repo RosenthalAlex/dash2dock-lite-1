@@ -46,6 +46,11 @@
         <summary>Open app animation</summary>
         <description>Open app animation.</description>
     </key>
+    <key type="b" name="minimize-to-tiles">
+        <default>false</default>
+        <summary>Minimize windows to tiles</summary>
+        <description>Minimized windows become tiles (thumbnail and app icon) before the trash, like the macOS Dock.</description>
+    </key>
     <key type="b" name="lamp-app-animation">
         <default>false</default>
         <summary>Minimize app lamp animation</summary>

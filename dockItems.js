@@ -308,7 +308,10 @@ export const DockIcon = GObject.registerClass(
     _createIcon(size) {
       this._iconActor = new St.Icon({
         name: 'd2daDockIconActor',
-        icon_name: this._default_icon_name || 'file',
+        // minimized window tiles draw a thumbnail instead of a themed icon
+        ...(this._default_gicon
+          ? { gicon: this._default_gicon }
+          : { icon_name: this._default_icon_name || 'file' }),
         icon_size: size,
         style_class: this._default_icon_style_class || '',
         track_hover: true,

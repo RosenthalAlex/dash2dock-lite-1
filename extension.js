@@ -34,6 +34,7 @@ import { Style } from './style.js';
 import { Dock } from './dock.js';
 import { Services } from './services.js';
 import { Integrations } from './integrations.js';
+import { MinimizedTiles } from './minimizedTiles.js';
 import { WindowTracker } from './windowTracker.js';
 import { runTests } from './diagnostics.js';
 import { probe, applySmokeSettings } from './probe.js';
@@ -123,6 +124,7 @@ const REACTIONS = Object.freeze({
   'edge-distance': ['layout', 'animate'],
   'shrink-icons': ['shrink', 'layout', 'animate'],
   'inner-icon-scale': ['layout', 'animate'],
+  'minimize-to-tiles': ['layout', 'animate'],
   'border-radius': ['debounced_style', 'animate'],
   'separator-thickness': ['style', 'recreate_docks', 'animate_preview'],
   'icon-border-color': ['style', 'layout', 'animate'],
@@ -309,6 +311,10 @@ export default class Dash2DockLiteExt extends Extension {
     this.integrations.extension = this;
     this.integrations.enable();
 
+    // minimized windows as tiles in the dock
+    this.minimizedTiles = new MinimizedTiles(this);
+    this.minimizedTiles.enable();
+
     // service
     this.services = new Services();
     this.services.extension = this;
@@ -368,6 +374,9 @@ export default class Dash2DockLiteExt extends Extension {
 
     this.windowTracker?.destroy();
     this.windowTracker = null;
+
+    this.minimizedTiles?.disable();
+    this.minimizedTiles = null;
 
     this.integrations.disable();
     this.integrations = null;

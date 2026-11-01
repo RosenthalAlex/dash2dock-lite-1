@@ -31,6 +31,10 @@ export const SettingsKeys = (patch) => {
       default_value: false,
       widget_type: 'switch',
     },
+    'minimize-to-tiles': {
+      default_value: false,
+      widget_type: 'switch',
+    },
     'inner-icon-scale': {
       default_value: 0.8,
       widget_type: 'scale',

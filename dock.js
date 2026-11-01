@@ -1218,6 +1218,11 @@ export let Dock = GObject.registerClass(
           this._needsLayout = true;
         }
       }
+
+      //---------------
+      // minimized windows, right before the trash (like macOS)
+      //---------------
+      this.extension.minimizedTiles?.reconcile(this);
     }
 
     _snapToContainerEdge(container, child, edge = true) {
