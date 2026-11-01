@@ -1240,12 +1240,16 @@ export let Animator = class {
       // allied areas
       //! this should be at the layout -- make independent of background
       // struts
+      // a docked (not autohidden) dock keeps windows as far above it as it
+      // floats above the screen edge, like on macOS (the background reaches
+      // 1.5 paddings beyond the icons, see DockBackground.update)
+      const floatGap = Math.max(0, edge_distance - 1.5 * dock._background._padding);
+      const keepAway = (size) =>
+        dock.extension.autohide_dash
+          ? size + iconSize * 0.2 * scaleFactor + edge_distance - dock._background._padding * scaleFactor
+          : size + 2 * floatGap;
       if (vertical) {
-        dock.struts.width =
-          dock._background.width +
-          iconSize * 0.2 * scaleFactor +
-          edge_distance -
-          dock._background._padding * scaleFactor;
+        dock.struts.width = keepAway(dock._background.width);
         dock.struts.height = dock.height;
 
         if (dock.extension.autohide_dash) {
@@ -1263,11 +1267,7 @@ export let Animator = class {
         }
       } else {
         dock.struts.width = dock.width;
-        dock.struts.height =
-          dock._background.height +
-          iconSize * 0.2 * scaleFactor +
-          edge_distance -
-          dock._background._padding * scaleFactor;
+        dock.struts.height = keepAway(dock._background.height);
 
         if (dock.extension.autohide_dash) {
           dock.struts.x = dock._background.x + dock._monitor.x;
