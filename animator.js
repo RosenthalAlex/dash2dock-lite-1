@@ -360,6 +360,38 @@ export let Animator = class {
         ? (animateIcons[i - NUM_IMAGINARY]._slotFactor ?? 1)
         : 1;
 
+    // nearest item on one side of a separator that has an icon to follow;
+    // skips other separators and items the Shell has already removed
+    const neighbour = (actor, key) => {
+      let item = actor[key];
+      while (item && (item._d2daDestroyed || !item._icon || !item.get_parent()))
+        item = item[key];
+      return item ?? null;
+    };
+
+    // a separator takes a gap of its own in the packing, so that it sits in
+    // the middle of an even space, like on macOS: on each side, as much room
+    // as there is between two icons
+    const sepThickness = dock.extension.separator_thickness || 0;
+    const sepBefore = new Set();
+    const shownSeparators = [];
+    if (sepThickness > 0) {
+      (dock._separators ?? []).forEach((sep) => {
+        if (sep._d2daDestroyed || !sep.get_parent()?.visible || !sep.visible) return;
+        const prev = neighbour(sep, '_prev');
+        const next = neighbour(sep, '_next');
+        if (!prev || !next || sepBefore.has(next)) return;
+        if (!animateIcons.includes(prev) || !animateIcons.includes(next)) return;
+        sepBefore.add(next);
+        shownSeparators.push(sep);
+      });
+    }
+    const gapOf = (i) =>
+      sepBefore.size && i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS &&
+      sepBefore.has(animateIcons[i - NUM_IMAGINARY])
+        ? SEP_GAP
+        : 0;
+
     // --- Step 2: Static Centers & Coordinate Decoupling (Measured directly from Clutter!) ---
     const firstIconObj = animateIcons[0];
     const lastIconObj = animateIcons[NUM_ICONS - 1];
@@ -392,6 +424,15 @@ export let Animator = class {
     // comes exclusively from the magnified icon widths themselves.
     const activePadding = basePadding;
     const activeContainerWidth = ICON_SIZE + activePadding;
+
+    // the room between the bodies of two icons (macOS icons draw theirs on
+    // ~80% of the canvas, which itself is inner-icon-scale of the slot)
+    const innerScale =
+      dock.extension._config?.inner_icon_scale ??
+      dock.extension.inner_icon_scale ??
+      0.8;
+    const bodyGap = activeContainerWidth - ICON_SIZE * innerScale * 0.8;
+    const SEP_GAP = Math.round(bodyGap + sepThickness);
 
     // Hit-test strictly within the visual bounds of the dock
     const primaryMouseVal = vertical ? py : px;
@@ -431,18 +472,23 @@ export let Animator = class {
     const staticCenters = [];
     let staticAcc = 0;
     let realSlots = 0;
+    let realGaps = 0;
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
         const w = activeContainerWidth * slotOf(i);
-        staticCenters.push(staticAcc + w / 2);
-        staticAcc += w;
-        if (i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS) realSlots += slotOf(i);
+        const gap = gapOf(i);
+        staticCenters.push(staticAcc + gap + w / 2);
+        staticAcc += gap + w;
+        if (i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS) {
+            realSlots += slotOf(i);
+            realGaps += gap;
+        }
     }
 
     // Compute decoupled mouse coordinates in the 18-icon coordinate system
     const primaryMouse = vertical ? py : px;
 
     // Calibrate pointer tracking by measuring relative to the unwarped active dock start
-    const activeUnpackedL = realSlots * activeContainerWidth;
+    const activeUnpackedL = realSlots * activeContainerWidth + realGaps;
     const unwarpedActiveStartX = staticDockStart - (activeUnpackedL - restingL) / 2;
     const xmLocalActive = primaryMouse - unwarpedActiveStartX;
 
@@ -478,7 +524,7 @@ export let Animator = class {
         if (i === 0) {
             currentPos = halfW;
         } else {
-            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
+            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
         packedCenters.push(currentPos);
     }
@@ -504,7 +550,7 @@ export let Animator = class {
         if (i === 0) {
             currentCenterPos = halfW;
         } else {
-            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
+            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
     }
     const centerPackedL = currentCenterPos + centerWidths[TOTAL_CALC_ICONS - 1] / 2;
@@ -555,7 +601,7 @@ export let Animator = class {
         if (i === 0) {
             adjCurrentPos = halfW;
         } else {
-            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
+            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
         adjustedPackedCenters.push(adjCurrentPos);
     }
@@ -1032,49 +1078,63 @@ export let Animator = class {
       }
     });
 
-    // separators
-    // nearest item on one side of a separator that has an icon to follow;
-    // skips other separators and items the Shell has already removed
-    const neighbour = (actor, key) => {
-      let item = actor[key];
-      while (item && (item._d2daDestroyed || !item._icon || !item.get_parent()))
-        item = item[key];
-      return item ?? null;
-    };
-
-    dock._separators.forEach((actor) => {
+    // separators: a thin line in the middle of the gap between its two icons,
+    // on whole pixels so that it stays sharp
+    (dock._separators ?? []).forEach((actor) => {
       // the Shell destroys its separator when it is no longer needed
       if (actor._d2daDestroyed || !actor.get_parent()) return;
 
       // size and visibility do not depend on the neighbours, so a separator
       // missing one never keeps a stale size or stays hidden
-      let thickness = dock.extension.separator_thickness || 0;
+      let thickness = sepThickness;
+      let length = Math.round(iconSize * 0.6 * scaleFactor);
       if (vertical) {
-        actor.width = iconSize * 0.5 * scaleFactor;
-        actor.height = thickness + 0.5;
+        actor.width = length;
+        actor.height = thickness;
       } else {
-        actor.width = thickness + 0.5;
-        actor.height = iconSize * 0.75 * scaleFactor;
+        actor.width = thickness;
+        actor.height = length;
       }
       actor.visible = thickness > 0;
+      if (!actor.visible) return;
+
+      // its layout takes the same room as its gap in the packing, so that the
+      // dock keeps its length
+      let margin = Math.max(0, (SEP_GAP - thickness) / 2);
+      let style = vertical
+        ? `margin-top: ${margin}px; margin-bottom: ${margin}px;`
+        : `margin-left: ${margin}px; margin-right: ${margin}px;`;
+      if (actor._d2daSepStyle !== style) {
+        actor._d2daSepStyle = style;
+        actor.style = style;
+      }
 
       let prev = neighbour(actor, '_prev');
       let next = neighbour(actor, '_next');
-      if (prev && next) {
-        actor.translationX =
-          (prev._icon.translationX + next._icon.translationX) / 2;
-        actor.translationY =
-          (prev._icon.translationY + next._icon.translationY) / 2;
+      let ax = vertical ? 1 : 0;
+      // where the separator is laid out, without its translation
+      let [lx, ly] = actor.get_transformed_position();
+      let layoutPos = (vertical ? ly : lx) - (vertical ? actor.translationY : actor.translationX);
+      let target = null;
+      if (prev && next && shownSeparators.includes(actor)) {
+        // between the drawn edges of its neighbours (they may be magnified)
+        let [pp, ps] = [prev._icon.get_transformed_position(), prev._icon.get_transformed_size()];
+        let np = next._icon.get_transformed_position();
+        target = (pp[ax] + ps[ax] + np[ax]) / 2 - thickness / 2;
       } else if (prev || next) {
         // at an end of the dock: follow the one neighbour there is
         let only = (prev ?? next)._icon;
-        actor.translationX = only.translationX;
-        actor.translationY = only.translationY;
+        target = layoutPos + (vertical ? only.translationY : only.translationX);
+      }
+      if (target !== null && !isNaN(target) && !isNaN(layoutPos)) {
+        let t = Math.round(target) - layoutPos;
+        if (vertical) actor.translationY = t;
+        else actor.translationX = t;
       }
 
       let any = next ?? prev;
       if (!vertical && any) {
-        actor.translationY = any.height / 2 - actor.height / 2;
+        actor.translationY = Math.round(any.height / 2 - actor.height / 2);
       } else if (vertical && any) {
         // actor.translationX = any.width / 2 - actor.width / 2;
       }

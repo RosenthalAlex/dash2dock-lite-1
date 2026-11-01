@@ -755,7 +755,8 @@ export let Dock = GObject.registerClass(
         this._separators.push(c);
         this._dashItems.push(c);
         c.visible = true;
-        c.style = 'margin-left: 8px; margin-right: 8px;';
+        // the animator sizes its margins to the separator gap
+        if (!c._d2daSepStyle) c.style = 'margin-left: 8px; margin-right: 8px;';
         return false;
       }
 
