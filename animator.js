@@ -353,6 +353,12 @@ export let Animator = class {
     const NUM_ICONS = animateIcons.length;
     const NUM_IMAGINARY = 4;
     const TOTAL_CALC_ICONS = NUM_IMAGINARY + NUM_ICONS + NUM_IMAGINARY;
+    // how open each slot is: a minimized window's tile opens and closes gradually, and must take
+    // only that share of the packing, else the icons jump when it finally goes
+    const slotOf = (i) =>
+      i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS
+        ? (animateIcons[i - NUM_IMAGINARY]._slotFactor ?? 1)
+        : 1;
 
     // --- Step 2: Static Centers & Coordinate Decoupling (Measured directly from Clutter!) ---
     const firstIconObj = animateIcons[0];
@@ -420,22 +426,29 @@ export let Animator = class {
     dock.animated = animated;
 
     // Compute unwarped static centers for all 18 calculated icons
+    // (a slot opening or closing counts for its share only, so that the pointer keeps magnifying
+    // the same icons when it finally goes)
     const staticCenters = [];
+    let staticAcc = 0;
+    let realSlots = 0;
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
-        staticCenters.push(i * activeContainerWidth + activeContainerWidth / 2);
+        const w = activeContainerWidth * slotOf(i);
+        staticCenters.push(staticAcc + w / 2);
+        staticAcc += w;
+        if (i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS) realSlots += slotOf(i);
     }
 
     // Compute decoupled mouse coordinates in the 18-icon coordinate system
     const primaryMouse = vertical ? py : px;
 
     // Calibrate pointer tracking by measuring relative to the unwarped active dock start
-    const activeUnpackedL = NUM_ICONS * activeContainerWidth;
+    const activeUnpackedL = realSlots * activeContainerWidth;
     const unwarpedActiveStartX = staticDockStart - (activeUnpackedL - restingL) / 2;
     const xmLocalActive = primaryMouse - unwarpedActiveStartX;
 
     const firstRealStaticLeft = staticCenters[NUM_IMAGINARY] - ICON_SIZE / 2;
     const xmLocalCalculated = xmLocalActive + firstRealStaticLeft;
-    const totalCalcStaticL = TOTAL_CALC_ICONS * activeContainerWidth;
+    const totalCalcStaticL = staticAcc;
     const xmClamped = Math.max(0, Math.min(totalCalcStaticL, xmLocalCalculated));
 
     // --- Step 3: Scaling & Perfectly Packed Centers ---
@@ -447,12 +460,12 @@ export let Animator = class {
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
         if (!hoverActive) {
             iconScales.push(1.0);
-            iconWidths.push(ICON_SIZE);
+            iconWidths.push(ICON_SIZE * slotOf(i));
         } else {
             const xi = staticCenters[i];
             const scale = getScale(xi, xmClamped, threshold, scaleAtMax, curveType);
             iconScales.push(scale);
-            iconWidths.push(ICON_SIZE * scale);
+            iconWidths.push(ICON_SIZE * scale * slotOf(i));
         }
     }
 
@@ -465,7 +478,7 @@ export let Animator = class {
         if (i === 0) {
             currentPos = halfW;
         } else {
-            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding;
+            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
         }
         packedCenters.push(currentPos);
     }
@@ -482,7 +495,7 @@ export let Animator = class {
         const targetScale = getScale(xi, centerMouse, threshold, scaleAtMax, curveType);
         const scale = 1.0 + (targetScale - 1.0) * activeHoverFactor;
         centerScales.push(scale);
-        centerWidths.push(ICON_SIZE * scale);
+        centerWidths.push(ICON_SIZE * scale * slotOf(i));
     }
 
     let currentCenterPos = 0;
@@ -491,7 +504,7 @@ export let Animator = class {
         if (i === 0) {
             currentCenterPos = halfW;
         } else {
-            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding;
+            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
         }
     }
     const centerPackedL = currentCenterPos + centerWidths[TOTAL_CALC_ICONS - 1] / 2;
@@ -499,8 +512,10 @@ export let Animator = class {
     // Distribute length variance evenly across all calculation nodes
     const variance = centerPackedL - activeL;
     const adjustedIconWidths = [];
+    let slotSum = 0;
+    for (let i = 0; i < TOTAL_CALC_ICONS; i++) slotSum += slotOf(i);
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
-        adjustedIconWidths.push(iconWidths[i] + variance / TOTAL_CALC_ICONS);
+        adjustedIconWidths.push(iconWidths[i] + (variance * slotOf(i)) / (slotSum || 1));
     }
 
     // Save the unshifted realLeftEdge before applying the mouse-proximity shift to imaginary icons
@@ -540,7 +555,7 @@ export let Animator = class {
         if (i === 0) {
             adjCurrentPos = halfW;
         } else {
-            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding;
+            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i);
         }
         adjustedPackedCenters.push(adjCurrentPos);
     }
