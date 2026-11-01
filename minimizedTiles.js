@@ -71,10 +71,32 @@ export const MinimizedTiles = class {
   _onUnminimize(actor) {
     const w = actor?.meta_window;
     if (!w || !this.entries.has(w)) return;
+    // the dock's genie removes the tile when the window is out (restored())
+    if (this.extension.genieController?.enabled) return;
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, REMOVE_DELAY_MS, () => {
       if (!w.minimized) this._forget(w);
       return GLib.SOURCE_REMOVE;
     });
+  }
+
+  /// The genie has put the window into its tile: time for its thumbnail.
+  landed(meta_window) {
+    this.entries.get(meta_window)?.land?.();
+  }
+
+  /// The genie has brought the window back out of its tile.
+  restored(meta_window) {
+    if (!meta_window.minimized) this._forget(meta_window);
+  }
+
+  /// The window pours out of its tile: the tile empties at once.
+  emptyTile(dock, meta_window) {
+    const tile = this.tileFor(dock, meta_window);
+    if (!tile?.child) return;
+    const gicon = new Gio.FileIcon({ file: Gio.File.new_for_path(this._blank) });
+    tile.child._default_gicon = gicon;
+    if (tile.child._iconActor) tile.child._iconActor.gicon = gicon;
+    this.extension.animate?.({ refresh: true });
   }
 
   _add(meta_window, already_hidden = false) {
@@ -89,12 +111,17 @@ export const MinimizedTiles = class {
     // the window is painted now, before the minimize effect hides it, but the slow part (reading
     // it back, scaling, saving) waits for the end of the magic lamp so that it does not stutter
     const snapshot = this._snapshot(meta_window, already_hidden);
-    // ready when the window lands in its tile
-    const delay = this._lampDuration();
-    new Promise((resolve) => GLib.timeout_add(GLib.PRIORITY_LOW, delay, () => {
-      resolve();
-      return GLib.SOURCE_REMOVE;
-    }))
+    // ready when the window lands in its tile: told by the dock's genie, else after the lamp
+    new Promise((resolve) => {
+      if (this.extension.genieController?.enabled && !already_hidden) {
+        entry.land = resolve;
+      } else {
+        GLib.timeout_add(GLib.PRIORITY_LOW, already_hidden ? 0 : this._lampDuration(), () => {
+          resolve();
+          return GLib.SOURCE_REMOVE;
+        });
+      }
+    })
       .then(() => (this.entries.has(meta_window) ? this._makeThumbnail(meta_window, snapshot) : null))
       .then((path) => {
         if (!this.entries.has(meta_window)) {

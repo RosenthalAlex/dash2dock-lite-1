@@ -35,6 +35,7 @@ import { Dock } from './dock.js';
 import { Services } from './services.js';
 import { Integrations } from './integrations.js';
 import { MinimizedTiles } from './minimizedTiles.js';
+import { GenieController } from './genieController.js';
 import { WindowTracker } from './windowTracker.js';
 import { runTests } from './diagnostics.js';
 import { probe, applySmokeSettings } from './probe.js';
@@ -125,6 +126,8 @@ const REACTIONS = Object.freeze({
   'shrink-icons': ['shrink', 'layout', 'animate'],
   'inner-icon-scale': ['layout', 'animate'],
   'minimize-to-tiles': ['layout', 'animate'],
+  'genie-effect': [],
+  'genie-duration': [],
   'border-radius': ['debounced_style', 'animate'],
   'separator-thickness': ['style', 'recreate_docks', 'animate_preview'],
   'icon-border-color': ['style', 'layout', 'animate'],
@@ -315,6 +318,10 @@ export default class Dash2DockLiteExt extends Extension {
     this.minimizedTiles = new MinimizedTiles(this);
     this.minimizedTiles.enable();
 
+    // the genie minimize animation, flying into the dock (after the tiles: they must exist first)
+    this.genieController = new GenieController(this);
+    this.genieController.enable();
+
     // service
     this.services = new Services();
     this.services.extension = this;
@@ -375,6 +382,8 @@ export default class Dash2DockLiteExt extends Extension {
     this.windowTracker?.destroy();
     this.windowTracker = null;
 
+    this.genieController?.disable();
+    this.genieController = null;
     this.minimizedTiles?.disable();
     this.minimizedTiles = null;
 

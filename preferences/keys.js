@@ -31,6 +31,14 @@ export const SettingsKeys = (patch) => {
       default_value: false,
       widget_type: 'switch',
     },
+    'genie-effect': {
+      default_value: false,
+      widget_type: 'switch',
+    },
+    'genie-duration': {
+      default_value: 420.0,
+      widget_type: 'scale',
+    },
     'minimize-to-tiles': {
       default_value: false,
       widget_type: 'switch',

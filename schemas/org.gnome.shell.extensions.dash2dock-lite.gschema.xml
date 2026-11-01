@@ -46,6 +46,16 @@
         <summary>Open app animation</summary>
         <description>Open app animation.</description>
     </key>
+    <key type="b" name="genie-effect">
+        <default>false</default>
+        <summary>Genie effect</summary>
+        <description>Minimize windows with a genie effect into their dock item (replaces a separate magic lamp extension).</description>
+    </key>
+    <key type="d" name="genie-duration">
+        <default>420.0</default>
+        <summary>Genie effect duration</summary>
+        <description>Duration of the genie effect in milliseconds.</description>
+    </key>
     <key type="b" name="minimize-to-tiles">
         <default>false</default>
         <summary>Minimize windows to tiles</summary>
