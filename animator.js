@@ -1132,11 +1132,21 @@ export let Animator = class {
         else actor.translationX = t;
       }
 
+      // across the dock: centered on its neighbour's slot (the layout already
+      // centers it in the row, but the row can be taller than the icons)
       let any = next ?? prev;
-      if (!vertical && any) {
-        actor.translationY = Math.round(any.height / 2 - actor.height / 2);
-      } else if (vertical && any) {
-        // actor.translationX = any.width / 2 - actor.width / 2;
+      if (any) {
+        let cross = vertical ? 0 : 1;
+        let [anyX, anyY] = any.get_transformed_position();
+        let anyPos = cross ? anyY : anyX;
+        let anySize = cross ? any.height : any.width;
+        let ownSize = cross ? actor.height : actor.width;
+        let ownPos = (cross ? ly : lx) - (cross ? actor.translationY : actor.translationX);
+        let t = Math.round(anyPos + anySize / 2 - ownSize / 2) - ownPos;
+        if (!isNaN(t)) {
+          if (cross) actor.translationY = t;
+          else actor.translationX = t;
+        }
       }
     });
 
