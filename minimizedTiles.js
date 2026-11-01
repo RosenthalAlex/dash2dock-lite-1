@@ -32,6 +32,11 @@ export const MinimizedTiles = class {
   enable() {
     GLib.mkdir_with_parents(THUMB_DIR, 0o755);
     this._clearThumbnails();
+    // an empty tile until the thumbnail is ready, rather than the app icon switching to it
+    this._blank = GLib.build_filenamev([THUMB_DIR, 'blank.png']);
+    const blank = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, true, 8, 8, 8);
+    blank.fill(0x00000000);
+    blank.savev(this._blank, 'png', [], []);
 
     const wm = global.window_manager;
     this._signals.push([wm, wm.connect('minimize', (_, actor) => this._onMinimize(actor))]);
@@ -84,7 +89,8 @@ export const MinimizedTiles = class {
     // the window is painted now, before the minimize effect hides it, but the slow part (reading
     // it back, scaling, saving) waits for the end of the magic lamp so that it does not stutter
     const snapshot = this._snapshot(meta_window, already_hidden);
-    const delay = this._lampDuration() + 150;
+    // ready when the window lands in its tile
+    const delay = this._lampDuration();
     new Promise((resolve) => GLib.timeout_add(GLib.PRIORITY_LOW, delay, () => {
       resolve();
       return GLib.SOURCE_REMOVE;
@@ -215,9 +221,9 @@ export const MinimizedTiles = class {
     tile.connect('destroy', () => (tile._d2daDestroyed = true));
 
     const icon = tile.child;
-    const gicon = entry.thumbnail
-      ? new Gio.FileIcon({ file: Gio.File.new_for_path(entry.thumbnail) })
-      : app?.get_icon();
+    const gicon = new Gio.FileIcon({
+      file: Gio.File.new_for_path(entry.thumbnail ?? this._blank),
+    });
     if (icon && gicon) {
       icon._default_gicon = gicon;
       if (icon._iconActor) icon._iconActor.gicon = gicon;
