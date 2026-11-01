@@ -736,6 +736,7 @@ export let Dock = GObject.registerClass(
       /* release any reference once destroyed */
       if (!c._destroyConnectId) {
         c._destroyConnectId = c.connect('destroy', () => {
+          c._d2daDestroyed = true;
           this._icons = null;
           this._needsLayout = true;
           c._label = null;
@@ -779,6 +780,13 @@ export let Dock = GObject.registerClass(
         let stIcon = null;
         if (appwell.icon /* BaseIcon or old IconGrid */) {
           stIcon = Compat.getStIcon(appwell) ?? appwell.icon.icon;
+        }
+        // A new app icon gets its texture only once it is styled, after
+        // the Shell adds it. Remember it so _findIcons() inspects again
+        // when the texture exists, instead of leaving it out of the cache.
+        if (!stIcon) {
+          this._pendingIcons ??= [];
+          this._pendingIcons.push(c);
         }
         if (stIcon) {
           c._grid = appwell.icon; // BaseIcon or old IconGrid
@@ -909,6 +917,15 @@ export let Dock = GObject.registerClass(
         }
       }
 
+      // an icon left out for lack of a texture has one now
+      if (
+        this._icons &&
+        this._pendingIcons?.some((c) => c.child?.icon && Compat.getStIcon(c.child))
+      ) {
+        this._icons = null;
+        this._needsLayout = true;
+      }
+
       if (this._icons) {
         // use icons cache
         return this._icons;
@@ -921,6 +938,7 @@ export let Dock = GObject.registerClass(
 
       this._dashItems = [];
       this._separators = [];
+      this._pendingIcons = [];
       this._icons = [];
 
       //--------------------

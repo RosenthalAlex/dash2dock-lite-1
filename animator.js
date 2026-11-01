@@ -1016,23 +1016,43 @@ export let Animator = class {
     });
 
     // separators
+    // nearest item on one side of a separator that has an icon to follow;
+    // skips other separators and items the Shell has already removed
+    const neighbour = (actor, key) => {
+      let item = actor[key];
+      while (item && (item._d2daDestroyed || !item._icon || !item.get_parent()))
+        item = item[key];
+      return item ?? null;
+    };
+
     dock._separators.forEach((actor) => {
-      let prev = actor._prev; // get_previous_sibling() || actor._prev;
-      let next = actor._next; // get_next_sibling();
-      if (prev && next && prev._icon && next._icon) {
+      // the Shell destroys its separator when it is no longer needed
+      if (actor._d2daDestroyed || !actor.get_parent()) return;
+
+      // size and visibility do not depend on the neighbours, so a separator
+      // missing one never keeps a stale size or stays hidden
+      let thickness = dock.extension.separator_thickness || 0;
+      if (vertical) {
+        actor.width = iconSize * 0.5 * scaleFactor;
+        actor.height = thickness + 0.5;
+      } else {
+        actor.width = thickness + 0.5;
+        actor.height = iconSize * 0.75 * scaleFactor;
+      }
+      actor.visible = thickness > 0;
+
+      let prev = neighbour(actor, '_prev');
+      let next = neighbour(actor, '_next');
+      if (prev && next) {
         actor.translationX =
           (prev._icon.translationX + next._icon.translationX) / 2;
         actor.translationY =
           (prev._icon.translationY + next._icon.translationY) / 2;
-        let thickness = dock.extension.separator_thickness || 0;
-        if (vertical) {
-          actor.width = iconSize * 0.5 * scaleFactor;
-          actor.height = thickness + 0.5;
-        } else {
-          actor.width = thickness + 0.5;
-          actor.height = iconSize * 0.75 * scaleFactor;
-        }
-        actor.visible = thickness > 0;
+      } else if (prev || next) {
+        // at an end of the dock: follow the one neighbour there is
+        let only = (prev ?? next)._icon;
+        actor.translationX = only.translationX;
+        actor.translationY = only.translationY;
       }
 
       let any = next ?? prev;
