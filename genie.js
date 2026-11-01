@@ -115,6 +115,13 @@ export const GenieEffect = GObject.registerClass(
   }
 );
 
+/// The shadow that the Rounded Window Corners extension draws for a window, as a separate actor
+/// below it, or null when the extension is not active for this window.
+function roundedCornersShadowOf(windowActor) {
+  const shadow = windowActor.rwcCustomData?.shadow;
+  return shadow && shadow.get_stage() ? shadow : null;
+}
+
 /// Runs the genie for a window actor: a clone flies above the dock while the window itself is
 /// transparent, then `onDone` is called.
 export function runGenie({ windowActor, position, getTarget, minimize, duration, onFrame, onDone }) {
@@ -124,7 +131,17 @@ export function runGenie({ windowActor, position, getTarget, minimize, duration,
   const clone = new Clutter.Clone({ source: windowActor, x, y, width: w, height: h });
   Main.layoutManager.uiGroup.add_child(clone);
   const originalOpacity = windowActor.opacity;
+  const shadow = roundedCornersShadowOf(windowActor);
+  const originalShadowOpacity = shadow?.opacity;
   windowActor.opacity = 0;
+  // Rounded Window Corners keeps its shadow on a sibling actor in windowGroup; hide it while the
+  // window is in flight so it neither stays behind on minimize nor waits at the destination on
+  // unminimize
+  let shadowDestroyId = 0;
+  if (shadow) {
+    shadow.opacity = 0;
+    shadowDestroyId = shadow.connect('destroy', () => (shadowDestroyId = 0));
+  }
 
   const effect = new GenieEffect({
     position,
@@ -148,8 +165,12 @@ export function runGenie({ windowActor, position, getTarget, minimize, duration,
     finished = true;
     timeline.stop();
     clone.destroy();
-    windowActor.opacity = originalOpacity;
     onDone?.();
+    windowActor.opacity = originalOpacity;
+    if (shadowDestroyId) {
+      shadow.disconnect(shadowDestroyId);
+      shadow.opacity = originalShadowOpacity;
+    }
   };
   timeline.connect('completed', finish);
   frame();
