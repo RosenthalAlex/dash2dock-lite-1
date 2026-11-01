@@ -114,7 +114,10 @@ export const GenieController = class {
     const tiles = this.extension.minimizedTiles;
     if (tiles?.enabled) {
       const tile = tiles.tileFor(dock, meta_window);
-      const rect = this._slotRect(dock, tile) || this._rectOf(dock._trashIcon);
+      // where the tile is drawn (its renderer follows the opening slot); its layout position can
+      // be off from what is on screen, which made the window land half into the trash
+      const rect =
+        this._rectOf(tile) || this._slotRect(dock, tile) || this._rectOf(dock._trashIcon);
       if (rect) return rect;
     }
     const icon = dock.findIconForWindow(meta_window);
