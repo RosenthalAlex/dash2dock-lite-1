@@ -205,6 +205,7 @@ export const MinimizedTiles = class {
           .sort((a, b) => a[1].order - b[1].order)
       : [];
     const wanted = new Set(windows.map(([w]) => w));
+    const created = [];
 
     dock._minimizedTiles.forEach((tile) => {
       if (!wanted.has(tile._minimizedWindow)) this._closeTile(dock, tile);
@@ -222,14 +223,15 @@ export const MinimizedTiles = class {
       if (!tile) {
         tile = this._createTile(dock, w, entry, label);
         dock._minimizedTiles.push(tile);
+        created.push(tile);
       }
     });
 
-    // order: oldest first, the newest right before the trash
+    // a new tile goes right before the trash (the newest next to it); tiles already in the dock
+    // stay where they are, so that a closing tile's slot shrinks in place and the others never
+    // hop over it
     const trash = dock._trashIcon && dock._trashIcon.get_parent() === box ? dock._trashIcon : null;
-    windows.forEach(([w]) => {
-      const tile = this.tileFor(dock, w);
-      if (!tile) return;
+    created.forEach((tile) => {
       box.remove_child(tile);
       if (trash) box.insert_child_below(tile, trash);
       else box.add_child(tile);
