@@ -377,7 +377,8 @@ export let Animator = class {
     const shownSeparators = [];
     if (sepThickness > 0) {
       (dock._separators ?? []).forEach((sep) => {
-        if (sep._d2daDestroyed || !sep.get_parent()?.visible || !sep.visible) return;
+        // (its own visibility is set below, from this list)
+        if (sep._d2daDestroyed || !sep.get_parent()?.visible) return;
         const prev = neighbour(sep, '_prev');
         const next = neighbour(sep, '_next');
         if (!prev || !next || sepBefore.has(next)) return;
@@ -1096,7 +1097,12 @@ export let Animator = class {
         actor.width = thickness;
         actor.height = length;
       }
-      actor.visible = thickness > 0;
+      // two separators with no icon between them (the Shell's, with no
+      // running app after it, and ours before the folders) show as one
+      let prev = neighbour(actor, '_prev');
+      let next = neighbour(actor, '_next');
+      let duplicate = prev && next && !shownSeparators.includes(actor);
+      actor.visible = thickness > 0 && !duplicate;
       if (!actor.visible) return;
 
       // its layout takes the same room as its gap in the packing, so that the
@@ -1110,8 +1116,6 @@ export let Animator = class {
         actor.style = style;
       }
 
-      let prev = neighbour(actor, '_prev');
-      let next = neighbour(actor, '_next');
       let ax = vertical ? 1 : 0;
       // where the separator is laid out, without its translation
       let [lx, ly] = actor.get_transformed_position();
