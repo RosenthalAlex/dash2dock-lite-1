@@ -319,7 +319,12 @@ export let Animator = class {
 
       if (icon._found && !icon._handled) {
         icon._handled = true;
-        dock._maybeBounce(icon, true);
+        if (
+          !dock._dragging &&
+          (!dock._lastDragEndTime || Date.now() - dock._lastDragEndTime > 2000)
+        ) {
+          dock._maybeBounce(icon, true);
+        }
       }
 
       icon._pos = [...pos];

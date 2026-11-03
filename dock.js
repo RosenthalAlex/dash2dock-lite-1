@@ -472,6 +472,7 @@ export let Dock = GObject.registerClass(
 
       this._dragging = false;
       this._lastDragEndTime = Date.now();
+      this._pauseAllBounce(2000);
       this._dndTargetIndex = null;
       this._icons = null;
       this._needsLayout = true;
@@ -1163,6 +1164,7 @@ export let Dock = GObject.registerClass(
           _draggable._dragEndId = _draggable.connect('drag-end', () => {
             this._dragging = false;
             this._lastDragEndTime = Date.now();
+            this._pauseAllBounce(2000);
             this._dragged = null;
             this._dndTargetIndex = null;
             this._icons = null;
@@ -1985,7 +1987,11 @@ export let Dock = GObject.registerClass(
     }
 
     _maybeBounce(container, just_do_it) {
-      if (this._pauseBounceUntil && Date.now() < this._pauseBounceUntil) {
+      if (
+        this._dragging ||
+        (this._lastDragEndTime && Date.now() - this._lastDragEndTime < 2000) ||
+        (this._pauseBounceUntil && Date.now() < this._pauseBounceUntil)
+      ) {
         return;
       }
       if (!this.extension.open_app_animation) {
