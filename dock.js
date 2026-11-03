@@ -1693,7 +1693,7 @@ export let Dock = GObject.registerClass(
       try {
         if (!this._frameTimeline) {
           this._frameTimeline = new Clutter.Timeline({
-            actor: this,
+            actor: global.stage,
             duration: 1000,
             repeat_count: -1,
           });

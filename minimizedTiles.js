@@ -169,6 +169,16 @@ export const MinimizedTiles = class {
   /// The genie has put the window into its tile: the picture is in, the app icon pops in.
   landed(meta_window) {
     this.reveal(meta_window, 1);
+    (this.extension.docks || []).forEach((dock) => {
+      const tile = this.tileFor(dock, meta_window);
+      if (tile) {
+        tile._slotTimeline?.stop();
+        tile._slotTimeline = null;
+        tile._slotFactor = undefined;
+        if (dock._itemSize) tile.width = dock._itemSize;
+        dock._beginAnimation?.();
+      }
+    });
     this._eachOverlay(meta_window, (overlay) => popIn(overlay._badge));
   }
 
@@ -293,6 +303,13 @@ export const MinimizedTiles = class {
       box.remove_child(tile);
       if (trash) box.insert_child_below(tile, trash);
       else box.add_child(tile);
+
+      if (!tile._revealed) {
+        this._animateSlot(dock, tile, 0, 1, this._openDuration());
+      } else {
+        tile._slotFactor = undefined;
+        if (dock._itemSize) tile.width = dock._itemSize;
+      }
     });
   }
 
@@ -327,13 +344,12 @@ export const MinimizedTiles = class {
 
     const overlay = this._createOverlay(meta_window, app);
     const revealed = (entry.reveal ?? 1) > 0;
+    tile._revealed = revealed;
     if (overlay._picture) overlay._picture.opacity = revealed ? 255 : 0;
     if (!revealed) {
       overlay._badge.opacity = 0;
       overlay._badge.set_scale(0, 0);
     }
-    // the dock makes room for the tile, like the macOS Dock, instead of the trash jumping aside
-    if (!revealed) this._animateSlot(dock, tile, 0, 1, this._openDuration());
     dock.renderArea?.add_child(overlay);
     tile._overlay = overlay;
     // called by the animator each time it places the tile's renderer
@@ -362,7 +378,7 @@ export const MinimizedTiles = class {
   _animateSlot(dock, tile, from, to, duration, onDone) {
     tile._slotTimeline?.stop();
     tile._slotFactor = from;
-    const timeline = new Clutter.Timeline({ actor: tile, duration });
+    const timeline = new Clutter.Timeline({ actor: global.stage, duration });
     tile._slotTimeline = timeline;
     const apply = () => {
       if (tile._d2daDestroyed) return;

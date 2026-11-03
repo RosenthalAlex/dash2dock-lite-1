@@ -25,6 +25,7 @@ import * as Fav from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Graphene from 'gi://Graphene';
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import { loadFile } from './utils.js';
@@ -1035,11 +1036,21 @@ export default class Dash2DockLiteExt extends Extension {
     });
     this.docks.forEach((dock) => {
       dock._updateTransparenies();
-      if (
-        dock.get_parent() === Main.uiGroup &&
-        Main.uiGroup.contains(global.top_window_group)
-      ) {
-        Main.uiGroup.set_child_below_sibling(dock, global.top_window_group);
+      if (dock.get_parent() === Main.uiGroup) {
+        if (
+          Main.layoutManager.modalGroup &&
+          Main.uiGroup.contains(Main.layoutManager.modalGroup)
+        ) {
+          Main.uiGroup.set_child_below_sibling(
+            dock,
+            Main.layoutManager.modalGroup
+          );
+        } else if (Main.uiGroup.contains(global.top_window_group)) {
+          Main.uiGroup.set_child_above_sibling(
+            dock,
+            global.top_window_group
+          );
+        }
       }
     });
     this.animate();
