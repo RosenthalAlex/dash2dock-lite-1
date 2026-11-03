@@ -17,6 +17,7 @@ import { live } from './probe.js';
 import {
   Bounce,
   Linear,
+  QuadraticEaseOut,
 } from './effects/easing.js';
 import {
   isInRect,
@@ -582,19 +583,21 @@ export let Animator = class {
     }
     const activeL = packedCenters[TOTAL_CALC_ICONS - 1] + iconWidths[TOTAL_CALC_ICONS - 1] / 2;
 
-    // --- Step 4: Invariance-Targeted Variance Distribution ---
-    // Pre-calculate target packed dock length at dead center (using the
-    // smoothed hoverAmount so the dock length stays completely still as the
-    // pointer moves near the left/right edges, preventing edge wobble).
+    // --- Step 4: Smooth Boundary Compensation (No Edge Wobble or Squish) ---
+    // At the left/right edges of the dock, part of the magnification bell
+    // extends onto the 4 imaginary boundary icons. Instead of cramming the
+    // missing width into the real icons (which squishes unmagnified icons
+    // together) or leaving it uncompensated (which shifts centeringShift and
+    // wobbles the dock), we absorb the variance evenly across all calculation
+    // nodes, AND absorb any residual real-span drift in the boundary imaginary
+    // icons so that realActiveL stays 100% invariant even across separators.
     const centerMouse = totalCalcStaticL / 2;
-    const centerScales = [];
     const centerWidths = [];
     const activeHoverFactor = !noAnimation ? hoverAmount : 0.0;
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
         const xi = staticCenters[i];
         const targetScale = getScale(xi, centerMouse, threshold, scaleAtMax, curveType);
         const scale = 1.0 + (targetScale - 1.0) * activeHoverFactor;
-        centerScales.push(scale);
         centerWidths.push(ICON_SIZE * scale * slotOf(i));
     }
 
@@ -636,7 +639,7 @@ export let Animator = class {
         adjustedPackedCenters.push(adjCurrentPos);
     }
 
-    // Extract the bounds of the 10 real icons from the 18 calculated nodes
+    // Extract the bounds of the real icons from the calculated nodes
     const realLeftEdge = adjustedPackedCenters[NUM_IMAGINARY] - adjustedIconWidths[NUM_IMAGINARY] / 2;
     const realRightEdge = adjustedPackedCenters[NUM_IMAGINARY + NUM_ICONS - 1] + adjustedIconWidths[NUM_IMAGINARY + NUM_ICONS - 1] / 2;
     const realActiveL = realRightEdge - realLeftEdge;
@@ -767,13 +770,14 @@ export let Animator = class {
       icon._icon.translationX = translationX;
       icon._icon.translationY = translationY;
 
-      // clear bounce animation
+      // preserve active bounce animation
       if (icon._appwell) {
-        icon._appwell.translationX = 0;
-        icon._appwell.translationY = 0;
-        didBounce = icon._appwell._bounce;
-        // clear bounce
-        icon._appwell._bounce = false;
+        if (icon._appwell._bounce) {
+          didBounce = true;
+        } else {
+          icon._appwell.translationX = 0;
+          icon._appwell.translationY = 0;
+        }
       }
     });
 
@@ -947,17 +951,28 @@ export let Animator = class {
 
         let hideLabel = true;
 
-        // label: macOS-style instant appearance above the hovered icon
+        // label: macOS-style instant appearance above the hovered icon.
+        // Never call icon._label.hide() / .show() here (only set opacity),
+        // because hiding/showing the label actor triggers a St/Clutter stage
+        // relayout that can perturb the Dash allocation.
+        let labelText = icon._labelText || icon._label?.text;
         if (
           !dock.extension.hide_labels &&
           icon === hoveredIcon &&
           (icon._targetScale > 1 || magnify == 0) &&
           icon._label &&
-          icon._label.text &&
-          icon._label.text.length
+          labelText &&
+          labelText.length
         ) {
           try {
             hideLabel = false;
+            if (icon._label.text !== labelText) {
+              icon._label.set_text(labelText);
+            }
+            icon._label.remove_all_transitions?.();
+            if (!icon._label.visible) {
+              icon._label.show();
+            }
             icon._label.opacity = 255;
           } catch (err) {
             // label not ready?
@@ -967,6 +982,7 @@ export let Animator = class {
         }
 
         if (hideLabel && icon._label) {
+          icon._label.remove_all_transitions?.();
           icon._label.opacity = 0;
         }
 
@@ -1083,8 +1099,21 @@ export let Animator = class {
       let prev = neighbour(actor, '_prev');
       let next = neighbour(actor, '_next');
       let duplicate = prev && next && !shownSeparators.includes(actor);
-      actor.visible = thickness > 0 && !duplicate;
-      if (!actor.visible) return;
+      let shouldShow = thickness > 0 && !duplicate;
+      actor.opacity = shouldShow ? 255 : 0;
+      if (!shouldShow) {
+        // collapse the duplicate separator's width & margins without hiding
+        // it (`actor.visible = false` triggers a synchronous StBoxLayout
+        // relayout mid-frame that shifts icon positions by SEP_GAP)
+        actor.width = 0;
+        actor.height = 0;
+        if (actor._d2daSepStyle !== 'margin: 0px;') {
+          actor._d2daSepStyle = 'margin: 0px;';
+          actor.style = 'margin: 0px;';
+        }
+        return;
+      }
+      if (!actor.visible) actor.visible = true;
 
       // its layout takes the same room as its gap in the packing, so that the
       // dock keeps its length
@@ -1304,7 +1333,24 @@ export let Animator = class {
     if (!dock) return;
 
     let tPos, tSize;
-    if (renderer) {
+    let renderOffset = dock.renderArea?.get_transformed_position?.();
+    if (
+      renderer &&
+      renderOffset &&
+      !isNaN(renderOffset[0]) &&
+      !isNaN(renderOffset[1])
+    ) {
+      // Compute the exact visual bounds of the renderer from its stage
+      // position and scale, instead of get_transformed_position()/size() which
+      // can read pre-allocation or pivot-skewed boxes on the same frame.
+      let rw = renderer.width * renderer.scaleX;
+      let rh = renderer.height * renderer.scaleY;
+      tSize = [rw, rh];
+      tPos = [
+        renderOffset[0] + renderer.x + renderer.translationX,
+        renderOffset[1] + renderer.y + renderer.translationY,
+      ];
+    } else if (renderer) {
       tSize = renderer.get_transformed_size();
       tPos = renderer.get_transformed_position();
     } else {
@@ -1320,19 +1366,20 @@ export let Animator = class {
     let sw = !isNaN(tSize[0]) ? tSize[0] : 0;
     let sh = !isNaN(tSize[1]) ? tSize[1] : 0;
 
-    let lsz = icon._label.get_transformed_size();
-    let lw = !isNaN(lsz[0]) && lsz[0] > 0 ? lsz[0] : 0;
-    let lh = !isNaN(lsz[1]) && lsz[1] > 0 ? lsz[1] : 0;
+    let lw = 0;
+    let lh = 0;
+    try {
+      let [, natW] = icon._label.get_preferred_width(-1);
+      let [, natH] = icon._label.get_preferred_height(natW);
+      lw = natW || 0;
+      lh = natH || 0;
+    } catch {
+      // fallback below
+    }
     if (!lw || !lh) {
-      try {
-        let [, natW] = icon._label.get_preferred_width(-1);
-        let [, natH] = icon._label.get_preferred_height(natW);
-        lw = lw || natW || icon._label.width || 0;
-        lh = lh || natH || icon._label.height || 0;
-      } catch {
-        lw = lw || icon._label.width || 0;
-        lh = lh || icon._label.height || 0;
-      }
+      let lsz = icon._label.get_transformed_size();
+      lw = lw || (!isNaN(lsz[0]) && lsz[0] > 0 ? lsz[0] : icon._label.width || 0);
+      lh = lh || (!isNaN(lsz[1]) && lsz[1] > 0 ? lsz[1] : icon._label.height || 0);
     }
 
     let lx = tPos[0] + sw / 2 - lw / 2;
@@ -1418,8 +1465,12 @@ export let Animator = class {
     let travel =
       (iconSize / 3) *
       ((0.25 + (dock.extension.animation_bounce_height ?? 0.75)) * 1.5);
+    appwell.translationX = 0;
+    appwell.translationY = 0;
     appwell.translation_x = 0;
     appwell.translation_y = 0;
+
+    dock._beginAnimation?.('bounce');
 
     const getTarget = (app_id) => {
       // disabled: the pool is destroyed and container._renderer is stale
@@ -1435,7 +1486,7 @@ export let Animator = class {
       return [icon, icon._appwell];
     };
 
-    const translateDecor = (container, appwell) => {
+    const translateDecor = (container, appwell, offset) => {
       try {
         if (!container._icon) return;
         let badge =
@@ -1444,31 +1495,37 @@ export let Animator = class {
             ? this._badges?.[container._idx]
             : null);
         if (dock.isVertical()) {
+          let tx = offset;
           if (container._renderer) {
-            container._renderer.translationX = appwell.translationX;
+            container._renderer.translationX = tx;
             container._renderer.translationY = 0;
           }
           if (container._image) {
-            container._image.translationX = appwell.translationX;
+            container._image.translationX = tx;
             container._image.translationY = 0;
           }
           if (badge) {
-            badge.translationX = appwell.translationX;
+            badge.translationX = tx;
             badge.translationY = 0;
           }
+          appwell.translationX = tx;
+          appwell.translation_x = tx;
         } else {
+          let ty = offset;
           if (container._renderer) {
             container._renderer.translationX = 0;
-            container._renderer.translationY = appwell.translationY;
+            container._renderer.translationY = ty;
           }
           if (container._image) {
             container._image.translationX = 0;
-            container._image.translationY = appwell.translationY;
+            container._image.translationY = ty;
           }
           if (badge) {
             badge.translationX = 0;
-            badge.translationY = appwell.translationY;
+            badge.translationY = ty;
           }
+          appwell.translationY = ty;
+          appwell.translation_y = ty;
         }
         if (container._label) {
           container._label.opacity = 0;
@@ -1478,58 +1535,49 @@ export let Animator = class {
       }
     };
 
-    let t = 250;
+    let tUp = 340;
+    let tDown = 560;
     let _frames = [
       {
-        _duration: t,
+        _duration: tUp,
         _func: (f, s) => {
-          let res = Linear.easeNone(f._time, 0, travel, f._duration);
+          let p = Math.min(1, Math.max(0, f._time / f._duration));
+          let res = QuadraticEaseOut(p) * travel;
           let [container, appwell] = getTarget(app_id);
           if (!appwell) return;
           try {
             appwell._bounce = true;
-            if (dock.isVertical()) {
-              appwell.translation_x =
-                dock._position == DockPosition.LEFT ? res : -res;
-            } else {
-              appwell.translation_y =
-                dock._position == DockPosition.BOTTOM ? -res : res;
-            }
+            let offset = dock.isVertical()
+              ? (dock._position == DockPosition.LEFT ? res : -res)
+              : (dock._position == DockPosition.BOTTOM ? -res : res);
+            translateDecor(container, appwell, offset);
           } catch (err) {
             console.error('d2da: bounceIcon frame', err);
           }
-          translateDecor(container, appwell);
         },
       },
       {
-        _duration: t * 3,
+        _duration: tDown,
         _func: (f, s) => {
           let res = Bounce.easeOut(f._time, travel, -travel, f._duration);
           let [container, appwell] = getTarget(app_id);
           if (!appwell) return;
           try {
             appwell._bounce = true;
-            if (dock.isVertical()) {
-              appwell.translation_x =
-                dock._position == DockPosition.LEFT ? res : -res;
-            } else {
-              appwell.translation_y =
-                dock._position == DockPosition.BOTTOM ? -res : res;
-            }
+            let offset = dock.isVertical()
+              ? (dock._position == DockPosition.LEFT ? res : -res)
+              : (dock._position == DockPosition.BOTTOM ? -res : res);
+            translateDecor(container, appwell, offset);
           } catch (err) {
             console.error('d2da: bounceIcon frame', err);
           }
-          translateDecor(container, appwell);
         },
       },
     ];
 
     let frames = [];
-    for (
-      let i = 0;
-      i < [3, 1, 2, 3][dock.extension.animation_bounce_frequency || 0];
-      i++
-    ) {
+    let repeatCount = [2, 1, 2, 3][dock.extension.animation_bounce_frequency || 0];
+    for (let i = 0; i < repeatCount; i++) {
       _frames.forEach((b) => {
         frames.push({
           ...b,
@@ -1546,25 +1594,10 @@ export let Animator = class {
           if (!appwell) return;
           try {
             appwell._bounce = true;
-            appwell.translation_x = 0;
-            appwell.translation_y = 0;
-            if (container._renderer) {
-              container._renderer.translationX = 0;
-              container._renderer.translationY = 0;
-            }
-            let badge =
-              container._badge ||
-              (container._idx !== undefined
-                ? this._badges?.[container._idx]
-                : null);
-            if (badge) {
-              badge.translationX = 0;
-              badge.translationY = 0;
-            }
+            translateDecor(container, appwell, 0);
           } catch (err) {
             console.error('d2da: bounceIcon reset frame', err);
           }
-          translateDecor(container, appwell);
         },
       },
       {
@@ -1574,6 +1607,7 @@ export let Animator = class {
           if (!appwell) return;
           try {
             appwell._bounce = false;
+            translateDecor(container, appwell, 0);
           } catch (err) {
             console.error('d2da: bounceIcon end frame', err);
           }

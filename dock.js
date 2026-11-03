@@ -1024,19 +1024,21 @@ export let Dock = GObject.registerClass(
       this._icons.forEach((c) => {
         if (!c._showLabel && c.showLabel) {
           c._showLabel = c.showLabel;
+          c._hideLabel = c.hideLabel;
+          // Labels are shown, positioned and hidden every frame by the
+          // animator based on dock._hoveredIcon. Suppressing GNOME Shell's
+          // own showLabel/hideLabel prevents its 100ms ease-to-0 / onComplete:
+          // label.hide() from racing with the animator and causing the label
+          // to flicker or jump to the unmagnified DashItemContainer position.
           c.showLabel = () => {
             if (this.extension.hide_labels) {
               return;
             }
-            if (c._label) {
-              c._showLabel();
-              try {
-                this.animator?.alignLabel(c);
-              } catch (err) {
-                console.error('d2da: alignLabel on showLabel', err);
-              }
+            if (c._label && c._labelText && c._label.text !== c._labelText) {
+              c._label.set_text(c._labelText);
             }
           };
+          c.hideLabel = () => {};
         }
         c._icon.pivot_point = pv;
         if (c._appwell || c === showAppsIcon) {
@@ -1582,17 +1584,13 @@ export let Dock = GObject.registerClass(
       this.animator.animate(dt);
 
       // hack to mitigate jerkiness when a new icon is inserted
-      if (!this._pauseBounce || this._pauseBounce <= 0) {
+      if (!this._pauseBounceUntil || Date.now() >= this._pauseBounceUntil) {
         while (this._fast_forward && this._fast_forward-- > 0) {
           this.animate(dt);
           this.dash.opacity = 0;
         }
       }
       this.simulated_pointer = null;
-
-      if (this._pauseBounce && this._pauseBounce > 0) {
-        this._pauseBounce -= dt;
-      }
     }
 
     //! move these generic functions outside of this class
@@ -1897,30 +1895,27 @@ export let Dock = GObject.registerClass(
     }
 
     _pauseAllBounce(t = 250) {
-      this._pauseBounce = t;
+      this._pauseBounceUntil = Date.now() + t;
     }
 
     _maybeBounce(container, just_do_it) {
-      if (this._pauseBounce && this._pauseBounce > 0) {
+      if (this._pauseBounceUntil && Date.now() < this._pauseBounceUntil) {
         return;
       }
       if (!this.extension.open_app_animation) {
         return;
       }
-      if (
-        !container.child.app ||
-        (container.child.app &&
-          container.child.app.get_n_windows &&
-          !container.child.app.get_n_windows())
-      ) {
-        if (container.child) {
-          this.animator.bounceIcon(container.child);
-          return;
-        }
+      let appwell = container._appwell || container.child;
+      if (!appwell) return;
+
+      let app = appwell.app;
+      if (!app || !app.get_n_windows || !app.get_n_windows()) {
+        this.animator.bounceIcon(appwell);
+        return;
       }
       // bounce the custom icons
       if (container.custom_icon || just_do_it) {
-        this.animator.bounceIcon(container.child);
+        this.animator.bounceIcon(appwell);
       }
     }
 
