@@ -180,8 +180,15 @@ export let Animator = class {
 
   _onRendererClick(evt) {
     let dock = this.dock;
+    if (
+      dock?._dragging ||
+      (dock?._lastDragEndTime && Date.now() - dock._lastDragEndTime < 500)
+    ) {
+      return Clutter.EVENT_STOP;
+    }
+
     let target = dock?._nearestIcon || dock?._hoveredIcon;
-    if (!target) return Clutter.EVENT_PROPAGATE;
+    if (!target || target._isDragPlaceholder) return Clutter.EVENT_PROPAGATE;
 
     let button = evt.get_button();
     if (button === Clutter.BUTTON_SECONDARY) {
@@ -307,7 +314,15 @@ export let Animator = class {
     animateIcons.forEach((icon) => {
       if (!icon._icon) return;
       let pos = icon.get_transformed_position();
-      if (!pos || isNaN(pos[0]) || isNaN(pos[1])) return;
+      if (!pos || isNaN(pos[0]) || isNaN(pos[1])) {
+        if (icon._isDragPlaceholder) {
+          pos = prevIcon?._fixedPosition
+            ? [...prevIcon._fixedPosition]
+            : [dock.x, dock.y];
+        } else {
+          return;
+        }
+      }
       positionedIcons.push(icon);
 
       if (icon._found && !icon._handled) {
@@ -336,9 +351,40 @@ export let Animator = class {
       return;
     }
 
+    let hasPlaceholder = animateIcons.some((icon) => icon._isDragPlaceholder);
+    animateIcons.forEach((icon) => {
+      if (icon._isDragPlaceholder) {
+        if (icon._slotFactor === undefined) icon._slotFactor = 0.0;
+        if (icon._slotFactor < 1.0) {
+          let step = (dt || 16.6) / 120.0;
+          icon._slotFactor = Math.min(1.0, icon._slotFactor + step);
+          this._settling = true;
+        }
+      } else if (
+        dock._dragging &&
+        (icon === dock._dragged || icon._icon === dock._dragged) &&
+        icon._appwell &&
+        dock._favorite_ids?.includes(Compat.getAppId(icon._appwell))
+      ) {
+        if (hasPlaceholder) {
+          if (icon._slotFactor === undefined) icon._slotFactor = 1.0;
+          if (icon._slotFactor > 0.0) {
+            let step = (dt || 16.6) / 120.0;
+            icon._slotFactor = Math.max(0.0, icon._slotFactor - step);
+            this._settling = true;
+          }
+        } else {
+          if (icon._slotFactor !== undefined && icon._slotFactor < 1.0) {
+            let step = (dt || 16.6) / 120.0;
+            icon._slotFactor = Math.min(1.0, icon._slotFactor + step);
+            this._settling = true;
+          }
+        }
+      }
+    });
+
     let noAnimation = !dock.extension.animate_icons_unmute;
     if (dock._dragging) {
-      noAnimation = true;
       isWithin = true;
     }
 
@@ -986,9 +1032,20 @@ export let Animator = class {
           icon._label.opacity = 0;
         }
 
-        //! todo... add placeholder opacity when dragging
-        renderer.opacity =
-          icon._icon == dock._dragged && dock._dragging ? 75 : 255;
+        if (icon._isDragPlaceholder) {
+          renderer.opacity = 0;
+          renderer.visible = false;
+          if (icon._label) {
+            icon._label.opacity = 0;
+          }
+        } else if (
+          dock._dragging &&
+          (icon === dock._dragged || icon._icon === dock._dragged)
+        ) {
+          renderer.opacity = hasPlaceholder ? 0 : 40;
+        } else {
+          renderer.opacity = 255;
+        }
       }
 
 
@@ -998,7 +1055,7 @@ export let Animator = class {
       let badge = this._badges[icon._idx];
       icon._badge = badge;
       badge.hide();
-      if (icon != dock._dragged) {
+      if (icon != dock._dragged && !icon._isDragPlaceholder) {
         let appNotices = icon._appwell
           ? dock.extension.services._appNotices[icon._appwell.app.get_id()]
           : null;
@@ -1042,6 +1099,7 @@ export let Animator = class {
       dots.hide();
       if (
         icon != dock._dragged &&
+        !icon._isDragPlaceholder &&
         icon._appwell &&
         icon._appwell.app &&
         icon._appwell.app.get_n_windows

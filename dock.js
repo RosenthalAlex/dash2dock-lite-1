@@ -2,6 +2,7 @@
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Fav from 'resource:///org/gnome/shell/ui/appFavorites.js';
+import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import * as Compat from './compat.js';
 
 import Shell from 'gi://Shell';
@@ -121,6 +122,8 @@ export let Dock = GObject.registerClass(
       this.renderArea.opacity = 0;
 
       this.add_child(this.renderArea);
+
+      this._delegate = this;
 
       this._scrollCounter = 0;
 
@@ -288,7 +291,13 @@ export let Dock = GObject.registerClass(
     }
 
     activateTargetIcon(target, button = 1) {
-      if (!target) return false;
+      if (
+        this._dragging ||
+        (this._lastDragEndTime && Date.now() - this._lastDragEndTime < 500)
+      ) {
+        return false;
+      }
+      if (!target || target._isDragPlaceholder) return false;
       let showAppsIcon = Compat.getDashShowAppsIcon(this.dash);
       if (showAppsIcon && target === showAppsIcon) {
         Compat.showOverviewApps(Main.overview);
@@ -399,11 +408,103 @@ export let Dock = GObject.registerClass(
       this._favorite_ids = Compat.getFavoriteAppIds(Fav.getAppFavorites());
       this._icons = null;
       this._needsLayout = true;
-      this._fast_forward = 20;
+      if (!this._dragging) {
+        this._fast_forward = 20;
+      }
       // this._debouncedBeginAnimation();
       this._beginAnimation();
       this.autohider._debounceCheckHide();
       return Clutter.EVENT_PROPAGATE;
+    }
+
+    handleDragOver(source, actor, x, y, time) {
+      if (!this.dash || !this.dash._box) {
+        return DND.DragMotionResult.NO_DROP;
+      }
+
+      const app = Dash.getAppFromSource(source);
+      if (!app || app.is_window_backed()) {
+        return DND.DragMotionResult.NO_DROP;
+      }
+
+      if (!global.settings.is_writable('favorite-apps')) {
+        return DND.DragMotionResult.NO_DROP;
+      }
+
+      this._dragging = true;
+
+      let favItems = (this._icons ?? []).filter((c) => {
+        if (c._isDragPlaceholder) return false;
+        if (!c._appwell) return false;
+        let id = Compat.getAppId(c._appwell);
+        return this._favorite_ids?.includes(id);
+      });
+
+      let numFavorites = favItems.length;
+      let targetPos = numFavorites;
+
+      let [stageX, stageY] = this.get_transformed_position();
+      let pointerVal = this.isVertical() ? stageY + y : stageX + x;
+
+      for (let i = 0; i < numFavorites; i++) {
+        let item = favItems[i];
+        let itemPos = item.get_transformed_position();
+        let center = this.isVertical()
+          ? (item._renderer?.y ?? itemPos[1]) + (item._renderer?.height ?? item.height) / 2
+          : (item._renderer?.x ?? itemPos[0]) + (item._renderer?.width ?? item.width) / 2;
+        if (pointerVal < center) {
+          targetPos = i;
+          break;
+        }
+      }
+
+      let box = this.dash._box;
+      let numChildren = Math.max(1, box.get_children().length);
+      let boxWidth = Math.max(1, box.width);
+      let mappedX = (targetPos + 0.5) * (boxWidth / numChildren);
+
+      return this.dash.handleDragOver(source, actor, mappedX, 0, time);
+    }
+
+    acceptDrop(source, actor, x, y, time) {
+      if (!this.dash || !this.dash._box) {
+        return false;
+      }
+
+      let favItems = (this._icons ?? []).filter((c) => {
+        if (c._isDragPlaceholder) return false;
+        if (!c._appwell) return false;
+        let id = Compat.getAppId(c._appwell);
+        return this._favorite_ids?.includes(id);
+      });
+
+      let numFavorites = favItems.length;
+      let targetPos = numFavorites;
+
+      let [stageX, stageY] = this.get_transformed_position();
+      let pointerVal = this.isVertical() ? stageY + y : stageX + x;
+
+      for (let i = 0; i < numFavorites; i++) {
+        let item = favItems[i];
+        let itemPos = item.get_transformed_position();
+        let center = this.isVertical()
+          ? (item._renderer?.y ?? itemPos[1]) + (item._renderer?.height ?? item.height) / 2
+          : (item._renderer?.x ?? itemPos[0]) + (item._renderer?.width ?? item.width) / 2;
+        if (pointerVal < center) {
+          targetPos = i;
+          break;
+        }
+      }
+
+      let box = this.dash._box;
+      let numChildren = Math.max(1, box.get_children().length);
+      let boxWidth = Math.max(1, box.width);
+      let mappedX = (targetPos + 0.5) * (boxWidth / numChildren);
+
+      let result = this.dash.acceptDrop(source, actor, mappedX, 0, time);
+      this._dragging = false;
+      this._lastDragEndTime = Date.now();
+      return result;
     }
     _onMonitorsChanged() {
       this._needsLayout = true;
@@ -527,6 +628,8 @@ export let Dock = GObject.registerClass(
       }
       let dashBox = Compat.getDashBox(this.dash);
       if (dashBox) {
+        dashBox._delegate = this;
+        dash._delegate = this;
         dashBox.clip_to_allocation = false;
         dashBox.connectObject(
           'child-added', () => {
@@ -767,6 +870,21 @@ export let Dock = GObject.registerClass(
         return false;
       }
 
+      /* DragPlaceholderItem */
+      if (
+        c.constructor?.name === 'DragPlaceholderItem' ||
+        c.child?.has_style_class_name?.('placeholder')
+      ) {
+        c._isDragPlaceholder = true;
+        c._icon = c.child ?? c;
+        c._icon.opacity = 0;
+        c._icon.reactive = false;
+        c._slotFactor ??= 0.0;
+        this._icons.push(c);
+        this._dashItems.push(c);
+        return true;
+      }
+
       /* ShowAppsIcon */
       if (c.icon /* BaseIcon or old IconGrid */) {
         let stIcon = Compat.getStIcon(c) ?? c.icon.icon;
@@ -902,7 +1020,7 @@ export let Dock = GObject.registerClass(
 
       let dashBox = Compat.getDashBox(this.dash);
 
-      if (this._icons && !this._dragging) {
+      if (this._icons) {
         let _boxIconsLength = dashBox?.get_children().length ?? 0;
         if (_boxIconsLength != this._boxIconsLength) {
           this._icons = null;
@@ -1055,6 +1173,12 @@ export let Dock = GObject.registerClass(
         if (c._appwell && !c._appwell._activate) {
           c._appwell._activate = c._appwell.activate;
           c._appwell.activate = (button) => {
+            if (
+              this._dragging ||
+              (this._lastDragEndTime && Date.now() - this._lastDragEndTime < 500)
+            ) {
+              return;
+            }
             try {
               let target =
                 this.animated && (this._nearestIcon || this._hoveredIcon)
@@ -1076,12 +1200,20 @@ export let Dock = GObject.registerClass(
         if (_draggable && !_draggable._dragBeginId) {
           _draggable._dragBeginId = _draggable.connect('drag-begin', () => {
             this._dragging = true;
-            this._dragged = icon;
+            this._dragged = c;
+            this._beginAnimation();
           });
           _draggable._dragEndId = _draggable.connect('drag-end', () => {
             this._dragging = false;
+            this._lastDragEndTime = Date.now();
+            this.dash?._clearDragPlaceholder?.();
+            if (this._dragged) {
+              this._dragged._slotFactor = undefined;
+            }
+            this._dragged = null;
             this._icons = null;
             this._needsLayout = true;
+            this._beginAnimation();
           });
         }
       });
@@ -1511,7 +1643,7 @@ export let Dock = GObject.registerClass(
       }
 
       this._needsLayout = false;
-      if (!this._fast_forward || this._fast_forward <= 0) {
+      if (!this._dragging && (!this._fast_forward || this._fast_forward <= 0)) {
         this._fast_forward = 20;
       }
       return true;
