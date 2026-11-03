@@ -555,51 +555,58 @@ export const DockBackground = GObject.registerClass(
         let ty2 = last._icon.translationY;
 
         // bottom
-        this.x = dp[0];
-        this.y = dp[1];
+        let x = dp[0];
+        let y = dp[1];
         let width = dock.dash.width;
         let height = dock.dash.height;
 
         if (dock.isVertical()) {
-          this.y += ty;
+          y += ty;
           height += ty2 - ty;
         } else {
-          this.x += tx;
+          x += tx;
           width += tx2 - tx;
         }
 
         // padding
-        this.x -= padding;
+        x -= padding;
         width += padding * 2;
-        this.y -= padding;
+        y -= padding;
         height += padding * 2;
 
-        if (!isNaN(width)) {
-          this.width = width;
-        }
-        if (!isNaN(height)) {
-          this.height = height;
-        }
-
-        this.x -= dock.x;
-        this.y -= dock.y;
+        x -= dock.x;
+        y -= dock.y;
         this._padding = padding;
 
         // adjust padding
         let az = -padding;
-        this.x += az / 2;
-        this.width -= az * (1 + !vertical);
-        this.y += az / 2;
-        this.height -= az * (1 + vertical);
+        x += az / 2;
+        width -= az * (1 + !vertical);
+        y += az / 2;
+        height -= az * (1 + vertical);
 
         if (panel_mode) {
           if (vertical) {
-            this.y = 0;
-            this.height = dock.height;
+            y = 0;
+            height = dock.height;
           } else {
-            this.x = 0;
-            this.width = dock.width;
+            x = 0;
+            width = dock.width;
           }
+        }
+
+        // on whole pixels: a fractional box lands on a different pixel from
+        // one frame to the next, and its edges (and the blur clipped to it)
+        // visibly shake while the icons move. Each edge is rounded on its
+        // own, so that the size follows the edges instead of jittering.
+        if ([x, y, width, height].every(Number.isFinite)) {
+          let x1 = Math.round(x);
+          let y1 = Math.round(y);
+          let x2 = Math.round(x + width);
+          let y2 = Math.round(y + height);
+          if (this.x !== x1 || this.y !== y1) this.set_position(x1, y1);
+          if (this.width !== x2 - x1) this.width = x2 - x1;
+          if (this.height !== y2 - y1) this.height = y2 - y1;
         }
 
         this.opacity = 255;

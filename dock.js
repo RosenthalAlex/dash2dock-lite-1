@@ -7,6 +7,7 @@ import * as Compat from './compat.js';
 import Shell from 'gi://Shell';
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import Graphene from 'gi://Graphene';
 import St from 'gi://St';
 
@@ -277,6 +278,7 @@ export let Dock = GObject.registerClass(
       this.animator.disable();
 
       // autohider.disable() -> show() -> slideIn() may re-arm these
+      this._stopFrameLoop(true);
       this.extension._hiTimer?.cancel(this._animationSeq);
       this.extension._loTimer?.cancel(this.debounceEndSeq);
       this.extension._loTimer?.cancel(this._debounceBeginAnimateSeq);
@@ -347,6 +349,11 @@ export let Dock = GObject.registerClass(
       return Clutter.EVENT_PROPAGATE;
     }
     _onLeaveEvent(evt) {
+      // run the loop so that the magnification closes smoothly, even if it
+      // had stopped while the pointer rested on the dock
+      if (this.animated) {
+        this._beginAnimation();
+      }
       this.autohider._debounceCheckHide();
       this._debounceEndAnimation();
       return Clutter.EVENT_PROPAGATE;
@@ -1445,7 +1452,7 @@ export let Dock = GObject.registerClass(
       // }
 
       // computation derived from animation scale, bounce travel, and edge distance
-      let magnify = this.extension.animation_magnify * 1.8;
+      let magnify = this.extension.animation_magnify * 2.0;
       let bounceHeight = this.extension.animation_bounce_height ?? 0.75;
       let bounceTravel = (iconSize / 3) * ((0.25 + bounceHeight) * 1.5);
       let edgeDistance = (this.extension.edge_distance || 0) * 20;
@@ -1595,33 +1602,33 @@ export let Dock = GObject.registerClass(
       }
       let xy = this.struts.get_transformed_position();
       let wh = [this.struts.width, this.struts.height];
-      if (isInRect([xy[0], xy[1], wh[0], wh[1]], p, 20)) {
+      if (isInRect([xy[0], xy[1], wh[0], wh[1]], p, 0)) {
         return true;
       }
 
       return this.animated && this._isWithinMagnifiedIcons(p);
     }
 
-    // While magnified, the enlarged icons reach beyond the struts. Count their
-    // whole area (struts plus every visible icon) as inside, else moving the
-    // pointer up onto a magnified icon stops the animation and the icon
-    // shrinks away from under the pointer.
+    // While magnified, the enlarged icons reach beyond the struts. Accept the
+    // pointer if it is within the dock struts OR within any individual visible
+    // icon renderer (so moving above a *non-magnified* part of the dock still
+    // cleanly exits magnification, like on macOS).
     _isWithinMagnifiedIcons(p) {
       if (!this.struts || !this.animator?._renderers) return false;
-      let [x1, y1] = this.struts.get_transformed_position();
-      let x2 = x1 + this.struts.width;
-      let y2 = y1 + this.struts.height;
+      let [sx, sy] = this.struts.get_transformed_position();
+      if (isInRect([sx, sy, this.struts.width, this.struts.height], p, 4)) {
+        return true;
+      }
       for (const r of this.animator._renderers) {
         if (!r.visible || !r.mapped) continue;
         const [rx, ry] = r.get_transformed_position();
         const [rw, rh] = r.get_transformed_size();
         if (isNaN(rx) || isNaN(ry)) continue;
-        x1 = Math.min(x1, rx);
-        y1 = Math.min(y1, ry);
-        x2 = Math.max(x2, rx + rw);
-        y2 = Math.max(y2, ry + rh);
+        if (isInRect([rx, ry, rw, rh], p, 6)) {
+          return true;
+        }
       }
-      return isInRect([x1, y1, x2 - x1, y2 - y1], p, 4);
+      return false;
     }
 
     _beginAnimation(caller) {
@@ -1629,6 +1636,19 @@ export let Dock = GObject.registerClass(
         this.add_style_class_name('hi');
         this.struts?.add_style_class_name('hi');
         this.dwell?.add_style_class_name('hi');
+      }
+
+      // called on every pointer motion (up to 1000 times a second with some
+      // mice): while the frame loop already runs, only push back its end
+      if (
+        this._icons &&
+        this._frameTimeline?.is_playing() &&
+        !this.extension.debug_visual
+      ) {
+        if (this.debounceEndSeq) {
+          this.extension._loTimer?.runDebounced(this.debounceEndSeq);
+        }
+        return;
       }
 
       this._favorite_ids = Compat.getFavoriteAppIds(Fav.getAppFavorites());
@@ -1648,6 +1668,13 @@ export let Dock = GObject.registerClass(
       }
 
       this.animationInterval = this.extension.animationInterval;
+      // default: one step per frame the compositor draws, timed with the
+      // frame clock (a GLib timeout at 15 ms beats against a 60/120/165 Hz
+      // display and makes the motion stutter); a frame rate set in the
+      // preferences keeps the old fixed-interval timer
+      if (!this.extension.animation_fps && this._startFrameLoop()) {
+        return;
+      }
       if (this.extension._hiTimer) {
         if (!this._animationSeq) {
           this._animationSeq = this.extension._hiTimer.runLoop(
@@ -1663,7 +1690,48 @@ export let Dock = GObject.registerClass(
       }
     }
 
+    _startFrameLoop() {
+      if (this._destroyed) return false;
+      try {
+        if (!this._frameTimeline) {
+          this._frameTimeline = new Clutter.Timeline({
+            actor: this,
+            duration: 1000,
+            repeat_count: -1,
+          });
+          this._frameTimeline.connect('new-frame', () => {
+            let now = GLib.get_monotonic_time();
+            let dt = this._lastFrameTime ? (now - this._lastFrameTime) / 1000 : 16.6;
+            this._lastFrameTime = now;
+            // a long gap (first frame, idle stage) is not a jump in time
+            dt = Math.max(1, Math.min(dt, 50));
+            this.animate(dt);
+          });
+        }
+        if (!this._frameTimeline.is_playing()) {
+          this._lastFrameTime = 0;
+          this._frameTimeline.start();
+        }
+        return true;
+      } catch (err) {
+        console.error('d2da: frame loop', err);
+        this._frameTimeline = null;
+        return false;
+      }
+    }
+
+    _stopFrameLoop(dispose = false) {
+      if (!this._frameTimeline) return;
+      this._frameTimeline.stop();
+      this._lastFrameTime = 0;
+      if (dispose) {
+        this._frameTimeline.run_dispose?.();
+        this._frameTimeline = null;
+      }
+    }
+
     _endAnimation() {
+      this._stopFrameLoop();
       if (this.extension.debug_visual) {
         this.remove_style_class_name('hi');
         this.struts?.remove_style_class_name('hi');
@@ -1707,6 +1775,7 @@ export let Dock = GObject.registerClass(
     }
 
     cancelAnimations() {
+      this._stopFrameLoop(true);
       this.extension._hiTimer.cancel(this._animationSeq);
       this._animationSeq = null;
       this.extension._hiTimer.cancel(this.autohider._animationSeq);
