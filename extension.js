@@ -34,6 +34,8 @@ import { Style } from './style.js';
 import { Dock } from './dock.js';
 import { Services } from './services.js';
 import { Integrations } from './integrations.js';
+import { MinimizedTiles } from './minimizedTiles.js';
+import { GenieController } from './genieController.js';
 import { WindowTracker } from './windowTracker.js';
 import { runTests } from './diagnostics.js';
 import { probe, applySmokeSettings } from './probe.js';
@@ -122,6 +124,10 @@ const REACTIONS = Object.freeze({
   'dock-padding': ['layout', 'animate'],
   'edge-distance': ['layout', 'animate'],
   'shrink-icons': ['shrink', 'layout', 'animate'],
+  'inner-icon-scale': ['layout', 'animate'],
+  'minimize-to-tiles': ['layout', 'animate'],
+  'genie-effect': [],
+  'genie-duration': [],
   'border-radius': ['debounced_style', 'animate'],
   'separator-thickness': ['style', 'recreate_docks', 'animate_preview'],
   'icon-border-color': ['style', 'layout', 'animate'],
@@ -308,6 +314,14 @@ export default class Dash2DockLiteExt extends Extension {
     this.integrations.extension = this;
     this.integrations.enable();
 
+    // minimized windows as tiles in the dock
+    this.minimizedTiles = new MinimizedTiles(this);
+    this.minimizedTiles.enable();
+
+    // the genie minimize animation, flying into the dock (after the tiles: they must exist first)
+    this.genieController = new GenieController(this);
+    this.genieController.enable();
+
     // service
     this.services = new Services();
     this.services.extension = this;
@@ -367,6 +381,11 @@ export default class Dash2DockLiteExt extends Extension {
 
     this.windowTracker?.destroy();
     this.windowTracker = null;
+
+    this.genieController?.disable();
+    this.genieController = null;
+    this.minimizedTiles?.disable();
+    this.minimizedTiles = null;
 
     this.integrations.disable();
     this.integrations = null;
@@ -503,6 +522,16 @@ export default class Dash2DockLiteExt extends Extension {
           speed_up = 0.5;
         }
         this._config.speed_up = speed_up;
+      }
+
+      {
+        let inner_icon_scale = this._config['inner-icon-scale'] ?? null;
+        if (typeof inner_icon_scale == 'string') {
+          inner_icon_scale = parseFloat(inner_icon_scale);
+        }
+        if (inner_icon_scale !== null && inner_icon_scale > 0 && inner_icon_scale <= 1) {
+          this._config.inner_icon_scale = inner_icon_scale;
+        }
       }
     }
 

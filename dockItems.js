@@ -168,8 +168,14 @@ export const DockItemDotsOverlay = GObject.registerClass(
       let renderer = this.renderer;
       let { appCount, position, vertical, extension, dock } = data;
 
-      renderer.width = dock._iconSizeScaledDown || icon._icon.width;
-      renderer.height = dock._iconSizeScaledDown || icon._icon.height;
+      let innerScale =
+        extension._config?.inner_icon_scale ??
+        extension.inner_icon_scale ??
+        0.8;
+      let baseIconSize =
+        (dock._iconSizeScaledDown || icon._icon.width) * innerScale;
+      renderer.width = baseIconSize;
+      renderer.height = baseIconSize;
       renderer.pivot_point = icon._icon.pivot_point;
 
       let canvasScale = renderer.width / renderer._canvas.width;
@@ -180,7 +186,7 @@ export const DockItemDotsOverlay = GObject.registerClass(
       renderer._canvas.set_scale(canvasScale, canvasScale);
 
       let offsetX = 0;
-      let offsetY = renderer.height * 0.125 * scale;
+      let offsetY = renderer.height * 0.17 * scale;
       if (vertical) {
         offsetX = -offsetY;
         if (position == DockPosition.RIGHT) {
@@ -234,7 +240,12 @@ export const DockItemBadgeOverlay = GObject.registerClass(
       let renderer = this.renderer;
       let { noticesCount, position, vertical, extension, dock } = data;
 
-      let baseIconSize = dock._iconSizeScaledDown || icon._icon.width;
+      let innerScale =
+        extension._config?.inner_icon_scale ??
+        extension.inner_icon_scale ??
+        0.8;
+      let baseIconSize =
+        (dock._iconSizeScaledDown || icon._icon.width) * innerScale;
       renderer.width = baseIconSize;
       renderer.height = baseIconSize;
       renderer.pivot_point = icon._icon.pivot_point;
@@ -281,13 +292,46 @@ export const DockIcon = GObject.registerClass(
           return Clutter.EVENT_STOP;
         };
         this._draggable._grabActor = () => {};
+        // GNOME 49+ starts drags with a gesture action that ignores `inhibit`: a drag begun on
+        // a dock item grabbed the pointer, then failed to make its drag actor and never let go,
+        // freezing the pointer. Dock items are not dragged: turn the gesture off.
+        const gesture = this._draggable._dndGesture;
+        if (gesture) {
+          gesture.enabled = false;
+          this.remove_action?.(gesture);
+        }
       }
+    }
+
+    // a safety net if a drag starts anyway: custom items (trash, folders, minimized windows) have
+    // no Shell app to make the drag actor from
+    getDragActor() {
+      if (typeof this.app?.create_icon_texture === 'function')
+        return super.getDragActor();
+      return new St.Icon({
+        gicon: this._default_gicon ?? null,
+        icon_name: this._default_gicon ? null : this._default_icon_name || 'file',
+        icon_size: this.iconSize ?? 48,
+      });
+    }
+
+    activate(button) {
+      // see APP_LAUNCHER_ID in dock.js
+      if (this.app?.get_id() === 'app-launcher.desktop') {
+        if (Main.overview.visible) Main.overview.hide();
+        else Main.overview.showApps();
+        return;
+      }
+      super.activate(button);
     }
 
     _createIcon(size) {
       this._iconActor = new St.Icon({
         name: 'd2daDockIconActor',
-        icon_name: this._default_icon_name || 'file',
+        // minimized window tiles draw a thumbnail instead of a themed icon
+        ...(this._default_gicon
+          ? { gicon: this._default_gicon }
+          : { icon_name: this._default_icon_name || 'file' }),
         icon_size: size,
         style_class: this._default_icon_style_class || '',
         track_hover: true,
@@ -511,51 +555,58 @@ export const DockBackground = GObject.registerClass(
         let ty2 = last._icon.translationY;
 
         // bottom
-        this.x = dp[0];
-        this.y = dp[1];
+        let x = dp[0];
+        let y = dp[1];
         let width = dock.dash.width;
         let height = dock.dash.height;
 
         if (dock.isVertical()) {
-          this.y += ty;
+          y += ty;
           height += ty2 - ty;
         } else {
-          this.x += tx;
+          x += tx;
           width += tx2 - tx;
         }
 
         // padding
-        this.x -= padding;
+        x -= padding;
         width += padding * 2;
-        this.y -= padding;
+        y -= padding;
         height += padding * 2;
 
-        if (!isNaN(width)) {
-          this.width = width;
-        }
-        if (!isNaN(height)) {
-          this.height = height;
-        }
-
-        this.x -= dock.x;
-        this.y -= dock.y;
+        x -= dock.x;
+        y -= dock.y;
         this._padding = padding;
 
         // adjust padding
         let az = -padding;
-        this.x += az / 2;
-        this.width -= az * (1 + !vertical);
-        this.y += az / 2;
-        this.height -= az * (1 + vertical);
+        x += az / 2;
+        width -= az * (1 + !vertical);
+        y += az / 2;
+        height -= az * (1 + vertical);
 
         if (panel_mode) {
           if (vertical) {
-            this.y = 0;
-            this.height = dock.height;
+            y = 0;
+            height = dock.height;
           } else {
-            this.x = 0;
-            this.width = dock.width;
+            x = 0;
+            width = dock.width;
           }
+        }
+
+        // on whole pixels: a fractional box lands on a different pixel from
+        // one frame to the next, and its edges (and the blur clipped to it)
+        // visibly shake while the icons move. Each edge is rounded on its
+        // own, so that the size follows the edges instead of jittering.
+        if ([x, y, width, height].every(Number.isFinite)) {
+          let x1 = Math.round(x);
+          let y1 = Math.round(y);
+          let x2 = Math.round(x + width);
+          let y2 = Math.round(y + height);
+          if (this.x !== x1 || this.y !== y1) this.set_position(x1, y1);
+          if (this.width !== x2 - x1) this.width = x2 - x1;
+          if (this.height !== y2 - y1) this.height = y2 - y1;
         }
 
         this.opacity = 255;

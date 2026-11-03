@@ -7,6 +7,7 @@ import * as Compat from './compat.js';
 import Shell from 'gi://Shell';
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import Graphene from 'gi://Graphene';
 import St from 'gi://St';
 
@@ -29,6 +30,9 @@ import {
 } from './utils.js';
 
 const Point = Graphene.Point;
+
+/// Desktop file id of a pinned item that opens the application grid.
+export const APP_LAUNCHER_ID = 'app-launcher.desktop';
 
 export const DockPosition = {
   BOTTOM: 'bottom',
@@ -64,7 +68,9 @@ export let Dock = GObject.registerClass(
         clip_to_allocation: true,
         x_align: Clutter.ActorAlign.CENTER,
         y_align: Clutter.ActorAlign.CENTER,
-        offscreen_redirect: Clutter.OffscreenRedirect.ALWAYS,
+        // not ALWAYS: Blur my Shell's dynamic blur has to see the stage
+        // behind the dock, which an always-offscreen container hides
+        offscreen_redirect: Clutter.OffscreenRedirect.AUTOMATIC_FOR_OPACITY,
       });
 
       this.extension = params.extension;
@@ -78,31 +84,31 @@ export let Dock = GObject.registerClass(
       this._background = new DockBackground({ name: 'd2daBackground' });
       this.add_child(this._background);
 
-      // for blur-my-shell
-      this._slider = {
-        // connect: () => false,
-        get_child: () => {
-          return this;
-        },
-        get_parent: () => {
-          return this;
-        },
+      // for blur-my-shell: it connects signals to the slider (Blur my Shell 76+),
+      // so it has to be a real GObject, not a plain JS object
+      this._slider = new St.Bin({ name: 'd2daSlider', visible: false });
+      this._slider.get_child = () => {
+        return this;
+      };
+      this._slider.get_parent = () => {
+        return this;
       };
 
       // pretend to be Dash-to-Dock
-      // required by blur-my-shell to find the dash upon disabling
-      this.fake_dash = new St.Widget({ name: 'dash' });
-      this.fake_dash.has_allocation = () => { return true; };
-      this.add_child(this.fake_dash);
-      this.fake_dash_background = new St.Widget({
-        name: 'd2daFakeDashBackground',
-        style_class: 'dash-background',
+      // Blur my Shell looks for a child named 'dash' with a '_background' and
+      // only blurs it once both have a real, non-zero allocation. The fake dash
+      // is an empty 1x1 widget that draws nothing; its '_background' is the
+      // real dock background, so the blur follows the dock's shape and radius.
+      // It sits at the bottom of the stack: Blur my Shell inserts its blur
+      // right below it, under the tinted dock background.
+      this.fake_dash = new St.Widget({
+        name: 'dash',
+        reactive: false,
+        width: 1,
+        height: 1,
       });
-      this.fake_dash.connect = () => false;
-      this.fake_dash_background.connect = () => false;
-      this.fake_dash.add_child(this.fake_dash_background);
-      this.fake_dash._background = this.fake_dash_background;
-      this.fake_dash.visible = false;
+      this.insert_child_at_index(this.fake_dash, 0);
+      this.fake_dash._background = this._background;
 
       this.renderArea = new St.Widget({
         name: 'DockRenderArea',
@@ -175,7 +181,10 @@ export let Dock = GObject.registerClass(
         this.dwell.destroy();
         this.struts = null;
         this.dwell = null;
-        this._slider = null;
+        if (this._slider) {
+          this._slider.destroy();
+          this._slider = null;
+        }
       }
       super.destroy();
     }
@@ -269,6 +278,7 @@ export let Dock = GObject.registerClass(
       this.animator.disable();
 
       // autohider.disable() -> show() -> slideIn() may re-arm these
+      this._stopFrameLoop(true);
       this.extension._hiTimer?.cancel(this._animationSeq);
       this.extension._loTimer?.cancel(this.debounceEndSeq);
       this.extension._loTimer?.cancel(this._debounceBeginAnimateSeq);
@@ -281,6 +291,15 @@ export let Dock = GObject.registerClass(
       if (!target) return false;
       let showAppsIcon = Compat.getDashShowAppsIcon(this.dash);
       if (showAppsIcon && target === showAppsIcon) {
+        Compat.showOverviewApps(Main.overview);
+        return true;
+      }
+      // a pinned "app-launcher.desktop" stands for the show-apps button, so that it can be
+      // placed anywhere among the favorites (e.g. right after the file manager)
+      if (
+        target._appwell &&
+        Compat.getAppId(target._appwell) === APP_LAUNCHER_ID
+      ) {
         Compat.showOverviewApps(Main.overview);
         return true;
       }
@@ -330,6 +349,11 @@ export let Dock = GObject.registerClass(
       return Clutter.EVENT_PROPAGATE;
     }
     _onLeaveEvent(evt) {
+      // run the loop so that the magnification closes smoothly, even if it
+      // had stopped while the pointer rested on the dock
+      if (this.animated) {
+        this._beginAnimation();
+      }
       this.autohider._debounceCheckHide();
       this._debounceEndAnimation();
       return Clutter.EVENT_PROPAGATE;
@@ -719,6 +743,7 @@ export let Dock = GObject.registerClass(
       /* release any reference once destroyed */
       if (!c._destroyConnectId) {
         c._destroyConnectId = c.connect('destroy', () => {
+          c._d2daDestroyed = true;
           this._icons = null;
           this._needsLayout = true;
           c._label = null;
@@ -737,7 +762,8 @@ export let Dock = GObject.registerClass(
         this._separators.push(c);
         this._dashItems.push(c);
         c.visible = true;
-        c.style = 'margin-left: 8px; margin-right: 8px;';
+        // the animator sizes its margins to the separator gap
+        if (!c._d2daSepStyle) c.style = 'margin-left: 8px; margin-right: 8px;';
         return false;
       }
 
@@ -762,6 +788,13 @@ export let Dock = GObject.registerClass(
         let stIcon = null;
         if (appwell.icon /* BaseIcon or old IconGrid */) {
           stIcon = Compat.getStIcon(appwell) ?? appwell.icon.icon;
+        }
+        // A new app icon gets its texture only once it is styled, after
+        // the Shell adds it. Remember it so _findIcons() inspects again
+        // when the texture exists, instead of leaving it out of the cache.
+        if (!stIcon) {
+          this._pendingIcons ??= [];
+          this._pendingIcons.push(c);
         }
         if (stIcon) {
           c._grid = appwell.icon; // BaseIcon or old IconGrid
@@ -838,18 +871,27 @@ export let Dock = GObject.registerClass(
       }
       // DockItemContainer menu; idempotent, also run on the item's own destroy
       c._destroyMenu?.();
-      // c._label is owned by the Shell DashItemContainer (destroyed with it)
-      if (c._label) {
-        let p = c._label.get_parent();
-        if (p) {
-          p.remove_child(c._label);
-        }
-      }
+      // c._label is owned by the Shell DashItemContainer (destroyed with it).
+      // Detaching it here can re-enter the parent's child-destruction loop
+      // during Dash teardown and abort gnome-shell: drop only our reference.
+      c._label = null;
       c._renderer = null;
       c._badge = null;
       c._dots = null;
       c._showLabel = null;
       this._needsLayout = true;
+    }
+
+    /// The dock icon of the application that owns a window, or null.
+    findIconForWindow(meta_window) {
+      let app = Shell.WindowTracker.get_default().get_window_app(meta_window);
+      if (!app) return null;
+      let id = app.get_id();
+      return (
+        this._findIcons().find(
+          (icon) => icon._appwell && Compat.getAppId(icon._appwell) === id
+        ) ?? null
+      );
     }
 
     _findIcons() {
@@ -883,6 +925,15 @@ export let Dock = GObject.registerClass(
         }
       }
 
+      // an icon left out for lack of a texture has one now
+      if (
+        this._icons &&
+        this._pendingIcons?.some((c) => c.child?.icon && Compat.getStIcon(c.child))
+      ) {
+        this._icons = null;
+        this._needsLayout = true;
+      }
+
       if (this._icons) {
         // use icons cache
         return this._icons;
@@ -895,6 +946,7 @@ export let Dock = GObject.registerClass(
 
       this._dashItems = [];
       this._separators = [];
+      this._pendingIcons = [];
       this._icons = [];
 
       //--------------------
@@ -903,16 +955,6 @@ export let Dock = GObject.registerClass(
       dashBox?.get_children().forEach((icon) => {
         this._inspectIcon(icon);
       });
-
-      // hack: sometimes the Dash creates more than one separator
-      // workaround - remove all separators in such situation
-      //! pinpoint the cause of the errors
-      if (this._separators.length > 1) {
-        while (this._separators.length > 0) {
-          dashBox?.remove_child(this._separators[0]);
-          this._separators.shift();
-        }
-      }
 
       // hide separator between running apps and favorites - if not needed
       if (this.extension.favorites_only) {
@@ -943,10 +985,12 @@ export let Dock = GObject.registerClass(
       if (showAppsIcon) {
         showAppsIcon.visible = this.extension.apps_icon;
         if (this._inspectIcon(showAppsIcon)) {
-          let icon = showAppsIcon._icon;
-          if (!icon._connected) {
-            icon._connected = true;
-            icon.connectObject(
+          // pointer input belongs to the Show Apps button, not the nested
+          // GNOME-owned texture (see icedman/dash2dock-lite#340)
+          let button = showAppsIcon.child;
+          if (button && !button._d2dlConnected) {
+            button._d2dlConnected = true;
+            button.connectObject(
               'button-press-event',
               () => {
                 let target =
@@ -974,38 +1018,38 @@ export let Dock = GObject.registerClass(
         }
       }
 
-      let noAnimation = !this.extension.animate_icons_unmute;
-
       let pv = new Point();
       pv.x = 0.5;
       pv.y = 0.5;
       this._icons.forEach((c) => {
         if (!c._showLabel && c.showLabel) {
           c._showLabel = c.showLabel;
+          c._hideLabel = c.hideLabel;
+          // Labels are shown, positioned and hidden every frame by the
+          // animator based on dock._hoveredIcon. Suppressing GNOME Shell's
+          // own showLabel/hideLabel prevents its 100ms ease-to-0 / onComplete:
+          // label.hide() from racing with the animator and causing the label
+          // to flicker or jump to the unmagnified DashItemContainer position.
           c.showLabel = () => {
             if (this.extension.hide_labels) {
               return;
             }
-            if (c._label) {
-              c._showLabel();
-              try {
-                this.animator?.alignLabel(c);
-              } catch (err) {
-                console.error('d2da: alignLabel on showLabel', err);
-              }
+            if (c._label && c._labelText && c._label.text !== c._labelText) {
+              c._label.set_text(c._labelText);
             }
           };
+          c.hideLabel = () => {};
         }
-        c._icon.track_hover = true;
-        c._icon.reactive = true;
         c._icon.pivot_point = pv;
-        if (c._button) {
-          c._button.reactive = noAnimation;
-          c._button.track_hover = noAnimation;
-          c.toggle_mode = false;
+        if (c._appwell || c === showAppsIcon) {
+          // Pointer input belongs to the owning AppIcon or button. A reactive,
+          // hover-tracked nested StIcon can refresh its style while the
+          // BaseIcon subtree is being destroyed, which aborts gnome-shell in
+          // clutter_actor_destroy_all_children() (icedman/dash2dock-lite#340)
+          c._icon.reactive = false;
+          c._icon.track_hover = false;
         }
         if (c._grid) {
-          // c._grid.style = noAnimation ? '' : 'background: none !important;';
           c._grid.style = 'background: none !important;';
         }
         if (c._appwell && !c._appwell._activate) {
@@ -1022,12 +1066,12 @@ export let Dock = GObject.registerClass(
             }
           };
         }
+        // No destroy callbacks on GNOME-owned StIcons: their destroy runs
+        // inside DashItemContainer teardown, and mutating other actor trees
+        // from there can abort gnome-shell. The container's own destroy
+        // handler (_inspectIcon) drops the cached references, and
+        // destroyDash() does the explicit cleanup when the dock goes away.
         let icon = c._icon;
-        if (icon && !icon._destroyConnectId) {
-          icon._destroyConnectId = icon.connect('destroy', () => {
-            this._cleanupIcon(c);
-          });
-        }
         let { _draggable } = c.child;
         if (_draggable && !_draggable._dragBeginId) {
           _draggable._dragBeginId = _draggable.connect('drag-begin', () => {
@@ -1184,6 +1228,11 @@ export let Dock = GObject.registerClass(
           this._needsLayout = true;
         }
       }
+
+      //---------------
+      // minimized windows, right before the trash (like macOS)
+      //---------------
+      this.extension.minimizedTiles?.reconcile(this);
     }
 
     _snapToContainerEdge(container, child, edge = true) {
@@ -1339,8 +1388,10 @@ export let Dock = GObject.registerClass(
       }
 
       let itemSize = Math.floor(iconSizeSpaced * scaleFactor);
+      this._itemSize = itemSize;
       this._icons.forEach((icon) => {
-        icon.width = itemSize;
+        // a slot opening or closing (minimized window tiles) is narrower
+        icon.width = itemSize * (icon._slotFactor ?? 1);
         icon.height = itemSize;
         if (icon.style != iconStyle) {
           icon.style = iconStyle;
@@ -1403,7 +1454,7 @@ export let Dock = GObject.registerClass(
       // }
 
       // computation derived from animation scale, bounce travel, and edge distance
-      let magnify = this.extension.animation_magnify * 1.8;
+      let magnify = this.extension.animation_magnify * 2.0;
       let bounceHeight = this.extension.animation_bounce_height ?? 0.75;
       let bounceTravel = (iconSize / 3) * ((0.25 + bounceHeight) * 1.5);
       let edgeDistance = (this.extension.edge_distance || 0) * 20;
@@ -1553,8 +1604,31 @@ export let Dock = GObject.registerClass(
       }
       let xy = this.struts.get_transformed_position();
       let wh = [this.struts.width, this.struts.height];
-      if (isInRect([xy[0], xy[1], wh[0], wh[1]], p, 20)) {
+      if (isInRect([xy[0], xy[1], wh[0], wh[1]], p, 0)) {
         return true;
+      }
+
+      return this.animated && this._isWithinMagnifiedIcons(p);
+    }
+
+    // While magnified, the enlarged icons reach beyond the struts. Accept the
+    // pointer if it is within the dock struts OR within any individual visible
+    // icon renderer (so moving above a *non-magnified* part of the dock still
+    // cleanly exits magnification, like on macOS).
+    _isWithinMagnifiedIcons(p) {
+      if (!this.struts || !this.animator?._renderers) return false;
+      let [sx, sy] = this.struts.get_transformed_position();
+      if (isInRect([sx, sy, this.struts.width, this.struts.height], p, 4)) {
+        return true;
+      }
+      for (const r of this.animator._renderers) {
+        if (!r.visible || !r.mapped) continue;
+        const [rx, ry] = r.get_transformed_position();
+        const [rw, rh] = r.get_transformed_size();
+        if (isNaN(rx) || isNaN(ry)) continue;
+        if (isInRect([rx, ry, rw, rh], p, 6)) {
+          return true;
+        }
       }
       return false;
     }
@@ -1564,6 +1638,19 @@ export let Dock = GObject.registerClass(
         this.add_style_class_name('hi');
         this.struts?.add_style_class_name('hi');
         this.dwell?.add_style_class_name('hi');
+      }
+
+      // called on every pointer motion (up to 1000 times a second with some
+      // mice): while the frame loop already runs, only push back its end
+      if (
+        this._icons &&
+        this._frameTimeline?.is_playing() &&
+        !this.extension.debug_visual
+      ) {
+        if (this.debounceEndSeq) {
+          this.extension._loTimer?.runDebounced(this.debounceEndSeq);
+        }
+        return;
       }
 
       this._favorite_ids = Compat.getFavoriteAppIds(Fav.getAppFavorites());
@@ -1583,6 +1670,13 @@ export let Dock = GObject.registerClass(
       }
 
       this.animationInterval = this.extension.animationInterval;
+      // default: one step per frame the compositor draws, timed with the
+      // frame clock (a GLib timeout at 15 ms beats against a 60/120/165 Hz
+      // display and makes the motion stutter); a frame rate set in the
+      // preferences keeps the old fixed-interval timer
+      if (!this.extension.animation_fps && this._startFrameLoop()) {
+        return;
+      }
       if (this.extension._hiTimer) {
         if (!this._animationSeq) {
           this._animationSeq = this.extension._hiTimer.runLoop(
@@ -1598,7 +1692,48 @@ export let Dock = GObject.registerClass(
       }
     }
 
+    _startFrameLoop() {
+      if (this._destroyed) return false;
+      try {
+        if (!this._frameTimeline) {
+          this._frameTimeline = new Clutter.Timeline({
+            actor: this,
+            duration: 1000,
+            repeat_count: -1,
+          });
+          this._frameTimeline.connect('new-frame', () => {
+            let now = GLib.get_monotonic_time();
+            let dt = this._lastFrameTime ? (now - this._lastFrameTime) / 1000 : 16.6;
+            this._lastFrameTime = now;
+            // a long gap (first frame, idle stage) is not a jump in time
+            dt = Math.max(1, Math.min(dt, 50));
+            this.animate(dt);
+          });
+        }
+        if (!this._frameTimeline.is_playing()) {
+          this._lastFrameTime = 0;
+          this._frameTimeline.start();
+        }
+        return true;
+      } catch (err) {
+        console.error('d2da: frame loop', err);
+        this._frameTimeline = null;
+        return false;
+      }
+    }
+
+    _stopFrameLoop(dispose = false) {
+      if (!this._frameTimeline) return;
+      this._frameTimeline.stop();
+      this._lastFrameTime = 0;
+      if (dispose) {
+        this._frameTimeline.run_dispose?.();
+        this._frameTimeline = null;
+      }
+    }
+
     _endAnimation() {
+      this._stopFrameLoop();
       if (this.extension.debug_visual) {
         this.remove_style_class_name('hi');
         this.struts?.remove_style_class_name('hi');
@@ -1642,6 +1777,7 @@ export let Dock = GObject.registerClass(
     }
 
     cancelAnimations() {
+      this._stopFrameLoop(true);
       this.extension._hiTimer.cancel(this._animationSeq);
       this._animationSeq = null;
       this.extension._hiTimer.cancel(this.autohider._animationSeq);

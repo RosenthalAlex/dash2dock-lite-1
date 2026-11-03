@@ -1,16 +1,69 @@
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+// from this version on Blur my Shell follows the dock background by itself
+const BMS_SELF_TRACKING_VERSION = 76;
+
 // these are hacks to make Dash2Dock Animated compatible with other Extensions
 //
 export const Integrations = class {
   enable() {
     this.hookCompiz();
     this.hookBms();
+
+    this._wmSignals = [
+      global.window_manager.connect('minimize', (_, actor) =>
+        this._pulseForLamp(actor, true)
+      ),
+      global.window_manager.connect('unminimize', (_, actor) =>
+        this._pulseForLamp(actor, false)
+      ),
+    ];
   }
 
   disable() {
+    this._wmSignals?.forEach((id) => global.window_manager.disconnect(id));
+    this._wmSignals = null;
     this.releaseCompiz();
     this.releaseBms();
+  }
+
+  // the dock icon swells when the magic lamp swallows a window into it,
+  // and when the window pours out of it again
+  _pulseForLamp(actor, minimize) {
+    if (!this._compiz || !this.extension.lamp_app_animation) return;
+    // with tiles the window does not go into its app icon
+    if (this.extension.minimize_to_tiles) return;
+    if (Main.overview.visible) return;
+    let meta_window = actor?.meta_window;
+    if (!meta_window) return;
+
+    let docks = this.extension.docks || [];
+    let dock =
+      docks.find((d) => d._monitorIndex == meta_window.get_monitor()) ??
+      docks[0];
+    if (!dock?.animator) return;
+
+    let duration = 250;
+    try {
+      duration = this._compiz.settingsData?.DURATION?.get() ?? duration;
+    } catch {
+      // settings not available
+    }
+
+    if (minimize) {
+      // when the bottom of the window reaches the icon
+      dock.animator.pulseIcon(meta_window, {
+        delay: duration * 0.55,
+        duration: 320,
+        amount: 0.14,
+      });
+    } else {
+      dock.animator.pulseIcon(meta_window, {
+        delay: 0,
+        duration: Math.max(280, duration * 0.7),
+        amount: 0.12,
+      });
+    }
   }
 
   hookCompiz(hook = true) {
@@ -38,107 +91,86 @@ export const Integrations = class {
     this._compiz = null;
   }
 
-  // override compiz getIcon
+  // override compiz getIcon: the lamp funnels into the dock icon itself (its visible width),
+  // like the macOS genie effect, instead of into a point of the screen edge
   compiz_getIcon(actor) {
-    let [success, icon] = actor.meta_window.get_icon_geometry();
+    let meta_window = actor.meta_window;
+    let [success, icon] = meta_window.get_icon_geometry();
     if (success) {
       return icon;
     }
 
+    let monitor = Main.layoutManager.monitors[meta_window.get_monitor()];
     let docks = this.extension.docks;
-
-    let monitor = Main.layoutManager.monitors[actor.meta_window.get_monitor()];
-    let dock = docks.find((d) => d._monitorIndex == monitor.index);
-
+    let dock =
+      docks.find((d) => d._monitorIndex == monitor.index) ?? docks[0];
+    let fallback = {
+      x: monitor.x + monitor.width / 2,
+      y: monitor.y + monitor.height,
+      width: 0,
+      height: 0,
+    };
     if (!dock) {
-      return { x: monitor.x, y: monitor.y, width: 0, height: 0 };
+      return fallback;
     }
 
-    let dashIcon = null;
-
-    let sz = dock._iconSizeScaledDown || dock._preferredIconSize();
-    let ofs = 0;
-    if (sz) {
-      let scale = dock.getMonitor().geometry_scale || 1;
-      ofs = (sz / 2) * scale;
+    let renderer = null;
+    const tiles = this.extension.minimizedTiles;
+    if (tiles?.enabled) {
+      // the window goes into (or comes out of) its tile before the trash; a tile made just now
+      // is not drawn yet, but it takes the trash's place, which moves on
+      const tile = tiles.tileFor(dock, meta_window);
+      if (tile?._renderer?.visible) renderer = tile._renderer;
+      else if (meta_window.minimized) renderer = dock._trashIcon?._renderer;
+    }
+    renderer ??= dock.findIconForWindow(meta_window)?._renderer;
+    if (!renderer || !renderer.visible) {
+      return fallback;
     }
 
-    let pids = null;
-    let pid = actor.get_meta_window()
-      ? actor.get_meta_window().get_pid()
-      : null;
-    if (pid) {
-      dock.dash._box
-        .get_children()
-        .filter(
-          (dashElement) =>
-            dashElement.child &&
-            dashElement.child._delegate &&
-            dashElement.child._delegate.app
-        )
-        .forEach((dashElement) => {
-          pids = dashElement.child._delegate.app.get_pids();
-          if (pids && pids.indexOf(pid) >= 0) {
-            let renderer = dashElement;
-            if (dashElement._renderer) {
-              dashElement = dashElement._renderer;
-            }
-            let transformed_position = dashElement.get_transformed_position();
-            if (
-              transformed_position &&
-              transformed_position[0] &&
-              transformed_position[1]
-            ) {
-              dashIcon = {
-                x: transformed_position[0],
-                y: transformed_position[1],
-                width: 0,
-                height: 0,
-              };
-              return;
-            }
-          }
-        });
+    let [x, y] = renderer.get_transformed_position();
+    let [w, h] = renderer.get_transformed_size();
+    if (!w || !h || isNaN(x) || isNaN(y)) {
+      return fallback;
     }
 
-    if (!dashIcon) {
-      return { x: monitor.x, y: monitor.y, width: 0, height: 0 };
-    }
-
-    // console.log('compiz-alike-magic-lamp-effect: getIcon');
-    // console.log(`x:${dashIcon.x} y:${dashIcon.y} w:${dashIcon.width} h:${dashIcon.height}`);
-    let x = dashIcon.x;
-    let y = dashIcon.y;
-    let w = 0; //dashIcon.width;
-    let h = 0; //dashIcon.height;
-
-    switch (dock._position) {
-      case 'left':
-        x = dock._monitor.x;
-        y += ofs;
-        break;
-      case 'right':
-        x = dock._monitor.x + dock._monitor.width;
-        y += ofs;
-        break;
-      case 'top':
-        y = dock._monitor.y;
-        x += ofs;
-        break;
-      case 'bottom':
-        y = dock._monitor.y + dock._monitor.height;
-        x += ofs;
-        break;
-    }
-
-    dashIcon = {
-      x: x,
-      y: y,
-      width: w,
-      height: h,
+    // macOS-style icons draw their body on ~80% of the canvas
+    let body = 0.8;
+    let rect = {
+      x: x + (w * (1 - body)) / 2,
+      y: y + (h * (1 - body)) / 2,
+      width: w * body,
+      height: h * body,
     };
 
-    return dashIcon;
+    // the lamp picks its direction from the screen edge the rect touches, and a magnified
+    // (raised) icon is too far from it: extend the rect to the dock's screen edge, and give
+    // the icon's outer edge as `clip` so the window stops in the icon instead of the edge
+    let mx = monitor.x;
+    let my = monitor.y;
+    let mw = monitor.width;
+    let mh = monitor.height;
+    switch (dock._position) {
+      case 'bottom':
+        rect.clip = rect.y + rect.height;
+        rect.height = my + mh - rect.y;
+        break;
+      case 'top':
+        rect.clip = rect.y;
+        rect.height = rect.y + rect.height - my;
+        rect.y = my;
+        break;
+      case 'left':
+        rect.clip = rect.x;
+        rect.width = rect.x + rect.width - mx;
+        rect.x = mx;
+        break;
+      case 'right':
+        rect.clip = rect.x + rect.width;
+        rect.width = mx + mw - rect.x;
+        break;
+    }
+    return rect;
   }
 
   hookBms(hook = true) {
@@ -150,7 +182,9 @@ export const Integrations = class {
 
     let bms = Main.extensionManager.lookup('blur-my-shell@aunetx');
     this._bms = bms;
-    if (bms && bms.stateObj && bms.metadata.version >= 70) {
+    // Blur my Shell 76+ tracks the dock geometry by itself: leave it alone
+    if (bms && bms.stateObj && bms.metadata.version >= 70 &&
+        bms.metadata.version < BMS_SELF_TRACKING_VERSION) {
       let obj = bms.stateObj;
       if (obj._dash_to_dock_blur) {
         if (!obj._dash_to_dock_blur.update_size_orig) {
@@ -189,6 +223,16 @@ export const Integrations = class {
 
     bms.visible = dock.extension.blur_background;
     if (!bms.visible) {
+      return;
+    }
+
+    // Blur my Shell 76+ positions, sizes and rounds the blur from the dock
+    // background (fake_dash._background) itself
+    if (
+      dock.extension.integrations._bms &&
+      dock.extension.integrations._bms.metadata.version >=
+        BMS_SELF_TRACKING_VERSION
+    ) {
       return;
     }
 

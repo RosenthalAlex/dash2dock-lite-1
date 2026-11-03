@@ -26,8 +26,15 @@ import {
 const ANIM_POSITION_PER_SEC = 550 / 1000;
 const ANIM_SIZE_PER_SEC = 250 / 1000;
 const ANIM_ICON_RAISE = 0.5;
-const ANIM_ICON_SCALE = 1.5;
+const ANIM_ICON_SCALE = 2.0;
 const ANIMATE_CACHE_LOOKUP = 4;
+
+// time constants (ms) of the magnification: how quickly the bump follows the
+// pointer, and how quickly it opens and closes when the pointer enters and
+// leaves the dock (63% of the way after one constant, 95% after three)
+const ANIM_TAU_POINTER = 6;
+const ANIM_TAU_OPEN = 55;
+const ANIM_TAU_CLOSE = 80;
 
 const DOT_CANVAS_SIZE = 96;
 
@@ -46,11 +53,30 @@ function getScale(u, xm, R, M, type = 0) {
         // Smoothstep Polynomial
         factor = t * t * (3 - 2 * t);
     } else {
-        // 0: Cosine Bell (standard macOS bell curve)
-        factor = Math.cos((dist / R) * (Math.PI / 2));
+        // 0: raised cosine bell (cos^2): a rounded peak on the hovered icon
+        // that falls off smoothly to the neighbours, like the macOS dock.
+        // A plain cosine is flat near the top, so the direct neighbours
+        // grew almost as large as the hovered icon.
+        const c = Math.cos((dist / R) * (Math.PI / 2));
+        factor = c * c;
     }
 
     return 1.0 + (M - 1.0) * factor;
+}
+
+/// Translation keeping a swollen icon anchored to the edge the dock is attached to.
+function pulseOffset(position, grow) {
+  switch (position) {
+    case DockPosition.BOTTOM:
+      return [-grow / 2, -grow];
+    case DockPosition.TOP:
+      return [-grow / 2, 0];
+    case DockPosition.LEFT:
+      return [0, -grow / 2];
+    case DockPosition.RIGHT:
+      return [-grow, -grow / 2];
+  }
+  return [-grow / 2, -grow / 2];
 }
 
 export let Animator = class {
@@ -111,10 +137,17 @@ export let Animator = class {
       let renderer = new St.Icon({
         icon_name: 'file',
         name: 'd2daIcon',
-        reactive: true,
+        // only reactive while magnified, so its unscaled 32*(icon_quality) box
+        // doesn't intercept clicks on windows above the dock at rest
+        reactive: false,
         icon_size: 24,
       });
       renderer.visible = false;
+      // Magnified icons stick out above the Shell Dash items, which handle
+      // clicks inside the dock: route clicks on the enlarged part here.
+      renderer.connect('button-release-event', (actor, evt) =>
+        this._onRendererClick(evt)
+      );
       target.add_child(renderer);
       this._renderers.push(renderer);
 
@@ -144,6 +177,25 @@ export let Animator = class {
     return true;
   }
 
+  _onRendererClick(evt) {
+    let dock = this.dock;
+    let target = dock?._nearestIcon || dock?._hoveredIcon;
+    if (!target) return Clutter.EVENT_PROPAGATE;
+
+    let button = evt.get_button();
+    if (button === Clutter.BUTTON_SECONDARY) {
+      if (target._appwell?.popupMenu) {
+        target._appwell.popupMenu();
+      } else if (target._menu?.popup) {
+        target._menu.popup();
+      }
+      return Clutter.EVENT_STOP;
+    }
+
+    dock.activateTargetIcon(target, button);
+    return Clutter.EVENT_STOP;
+  }
+
   //! begin optimization
   animate(dt) {
     try {
@@ -156,6 +208,7 @@ export let Animator = class {
   _animate(dt) {
     let dock = this.dock;
     if (!dock) return;
+    this._lastAnimateTime = Date.now();
 
     if (dock._hoveredIcon) {
       dock._lastHoveredIcon = dock._hoveredIcon;
@@ -225,6 +278,10 @@ export let Animator = class {
     let [px, py] = pointer;
 
     let vertical = dock.isVertical();
+    // Remember whether magnification was already active before _isWithinDash()
+    // runs (otherwise dock.animated is overwritten on line 286 before the
+    // precise hit-test below can check it).
+    let wasAnimated = Boolean(dock.animated);
     let isWithin = dock._isWithinDash([px, py]);
 
     if (m.inFullscreen) {
@@ -242,10 +299,15 @@ export let Animator = class {
 
     let idx = 0;
     let prevIcon = null;
+    // icons without a texture or a valid position (being created or torn down
+    // by the Shell Dash) are skipped here, so they must not reach the layout
+    // math below, which reads _fixedPosition of every icon
+    let positionedIcons = [];
     animateIcons.forEach((icon) => {
       if (!icon._icon) return;
       let pos = icon.get_transformed_position();
       if (!pos || isNaN(pos[0]) || isNaN(pos[1])) return;
+      positionedIcons.push(icon);
 
       if (icon._found && !icon._handled) {
         icon._handled = true;
@@ -268,6 +330,11 @@ export let Animator = class {
       prevIcon = icon;
     });
 
+    animateIcons = positionedIcons;
+    if (!animateIcons.length) {
+      return;
+    }
+
     let noAnimation = !dock.extension.animate_icons_unmute;
     if (dock._dragging) {
       noAnimation = true;
@@ -284,8 +351,11 @@ export let Animator = class {
     let magnify = dock.extension.animation_magnify * ANIM_ICON_SCALE;
     let spread = dock.extension.animation_spread;
 
-    // Keep magnification independent from spread
-    let threshold = (iconSize + 10) * 2.5 * scaleFactor;
+    // Magnification radius in icon slots, set by the "spread" preference:
+    // 0 -> 1.5 slots (only the direct neighbours grow a little),
+    // 1 -> 4 slots (a wide, gentle wave)
+    let spreadSlots = 1.5 + 2.5 * Math.max(0, Math.min(1, spread ?? 0.42));
+    let threshold = (iconSize + 10) * spreadSlots * scaleFactor;
     if (animated && edge_distance < 0) {
       edge_distance = 0;
     }
@@ -296,6 +366,45 @@ export let Animator = class {
     const NUM_ICONS = animateIcons.length;
     const NUM_IMAGINARY = 4;
     const TOTAL_CALC_ICONS = NUM_IMAGINARY + NUM_ICONS + NUM_IMAGINARY;
+    // how open each slot is: a minimized window's tile opens and closes gradually, and must take
+    // only that share of the packing, else the icons jump when it finally goes
+    const slotOf = (i) =>
+      i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS
+        ? (animateIcons[i - NUM_IMAGINARY]._slotFactor ?? 1)
+        : 1;
+
+    // nearest item on one side of a separator that has an icon to follow;
+    // skips other separators and items the Shell has already removed
+    const neighbour = (actor, key) => {
+      let item = actor[key];
+      while (item && (item._d2daDestroyed || !item._icon || !item.get_parent()))
+        item = item[key];
+      return item ?? null;
+    };
+
+    // a separator takes a gap of its own in the packing, so that it sits in
+    // the middle of an even space, like on macOS: on each side, as much room
+    // as there is between two icons
+    const sepThickness = dock.extension.separator_thickness || 0;
+    const sepBefore = new Set();
+    const shownSeparators = [];
+    if (sepThickness > 0) {
+      (dock._separators ?? []).forEach((sep) => {
+        // (its own visibility is set below, from this list)
+        if (sep._d2daDestroyed || !sep.get_parent()?.visible) return;
+        const prev = neighbour(sep, '_prev');
+        const next = neighbour(sep, '_next');
+        if (!prev || !next || sepBefore.has(next)) return;
+        if (!animateIcons.includes(prev) || !animateIcons.includes(next)) return;
+        sepBefore.add(next);
+        shownSeparators.push(sep);
+      });
+    }
+    const gapOf = (i) =>
+      sepBefore.size && i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS &&
+      sepBefore.has(animateIcons[i - NUM_IMAGINARY])
+        ? SEP_GAP
+        : 0;
 
     // --- Step 2: Static Centers & Coordinate Decoupling (Measured directly from Clutter!) ---
     const firstIconObj = animateIcons[0];
@@ -330,6 +439,15 @@ export let Animator = class {
     const activePadding = basePadding;
     const activeContainerWidth = ICON_SIZE + activePadding;
 
+    // the room between the bodies of two icons (macOS icons draw theirs on
+    // ~80% of the canvas, which itself is inner-icon-scale of the slot)
+    const innerScale =
+      dock.extension._config?.inner_icon_scale ??
+      dock.extension.inner_icon_scale ??
+      0.8;
+    const bodyGap = activeContainerWidth - ICON_SIZE * innerScale * 0.8;
+    const SEP_GAP = Math.round(bodyGap + sepThickness);
+
     // Hit-test strictly within the visual bounds of the dock
     const primaryMouseVal = vertical ? py : px;
     const secondaryMouseVal = vertical ? px : py;
@@ -339,18 +457,26 @@ export let Animator = class {
     const tx1 = firstIconObj._icon ? (vertical ? firstIconObj._icon.translationY : firstIconObj._icon.translationX) : 0;
     const tx2 = lastIconObj._icon ? (vertical ? lastIconObj._icon.translationY : lastIconObj._icon.translationX) : 0;
 
-    const dockVisualStart = staticDockStart + (animated ? Math.min(0, tx1) : 0) - dockPad;
-    const dockVisualEnd = staticDockStart + restingL + (animated ? Math.max(0, tx2) : 0) + dockPad;
+    const dockVisualStart = staticDockStart + (wasAnimated ? Math.min(0, tx1) : 0) - dockPad;
+    const dockVisualEnd = staticDockStart + restingL + (wasAnimated ? Math.max(0, tx2) : 0) + dockPad;
     const isWithinPrimary = (primaryMouseVal >= dockVisualStart && primaryMouseVal <= dockVisualEnd);
 
     const iconCenterSec = firstIconSecondary + ICON_SIZE / 2;
     const secondaryDist = Math.abs(secondaryMouseVal - iconCenterSec);
-    const maxSecReach = animated
-      ? (scaleAtMax * ICON_SIZE) / 2 + rise * scaleFactor + dockPad + 4
-      : ICON_SIZE / 2 + dockPad + 4;
+    // At rest, only trigger magnification when the pointer enters the resting
+    // dock/icon bounds. Once magnified, dock._isWithinMagnifiedIcons() checks
+    // whether the pointer is over the dock or the currently magnified icon.
+    const maxSecReach = ICON_SIZE / 2 + dockPad + 4;
     const isWithinSecondary = (secondaryDist <= maxSecReach);
 
-    isWithin = isWithinPrimary && isWithinSecondary;
+    // Only expand the vertical hit-test to the magnified icons if magnification
+    // was ALREADY active (wasAnimated). Starting from rest requires entering
+    // the resting icon/dock bounds, so hovering above the dock never triggers
+    // magnification.
+    isWithin =
+      isWithinPrimary &&
+      (isWithinSecondary ||
+        (wasAnimated && dock._isWithinMagnifiedIcons([px, py])));
     if (m.inFullscreen) {
         isWithin = false;
     }
@@ -358,23 +484,35 @@ export let Animator = class {
     dock.animated = animated;
 
     // Compute unwarped static centers for all 18 calculated icons
+    // (a slot opening or closing counts for its share only, so that the pointer keeps magnifying
+    // the same icons when it finally goes)
     const staticCenters = [];
+    let staticAcc = 0;
+    let realSlots = 0;
+    let realGaps = 0;
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
-        staticCenters.push(i * activeContainerWidth + activeContainerWidth / 2);
+        const w = activeContainerWidth * slotOf(i);
+        const gap = gapOf(i);
+        staticCenters.push(staticAcc + gap + w / 2);
+        staticAcc += gap + w;
+        if (i >= NUM_IMAGINARY && i < NUM_IMAGINARY + NUM_ICONS) {
+            realSlots += slotOf(i);
+            realGaps += gap;
+        }
     }
 
     // Compute decoupled mouse coordinates in the 18-icon coordinate system
     const primaryMouse = vertical ? py : px;
 
     // Calibrate pointer tracking by measuring relative to the unwarped active dock start
-    const activeUnpackedL = NUM_ICONS * activeContainerWidth;
+    const activeUnpackedL = realSlots * activeContainerWidth + realGaps;
     const unwarpedActiveStartX = staticDockStart - (activeUnpackedL - restingL) / 2;
     const xmLocalActive = primaryMouse - unwarpedActiveStartX;
 
     const firstRealStaticLeft = staticCenters[NUM_IMAGINARY] - ICON_SIZE / 2;
     const xmLocalCalculated = xmLocalActive + firstRealStaticLeft;
-    const totalCalcStaticL = TOTAL_CALC_ICONS * activeContainerWidth;
-    const xmClamped = Math.max(0, Math.min(totalCalcStaticL, xmLocalCalculated));
+    const totalCalcStaticL = staticAcc;
+    const xmRaw = Math.max(0, Math.min(totalCalcStaticL, xmLocalCalculated));
 
     // --- Step 3: Scaling & Perfectly Packed Centers ---
     const curveType = dock.extension.animation_rise_curve ?? 0;
@@ -382,15 +520,50 @@ export let Animator = class {
     const iconWidths = [];
     const hoverActive = isWithin;
 
+    // Smooth, macOS-like motion: the layout below is a pure function of two
+    // smoothed inputs, the pointer and how far the magnification is open.
+    // Every icon size, position and the background derive from the same
+    // values in the same frame, so nothing lags behind anything else (the old
+    // per-property chasing let sizes, positions and the background drift
+    // apart, which looked choppy and made the dock edges wobble).
+    {
+      const speed = dock.extension._config?.speed_up || 1;
+      const ease = (tau) => 1 - Math.exp(-(dt || 16.6) * speed / tau);
+      if (this._hoverAmount === undefined) this._hoverAmount = 0;
+      if (hoverActive) {
+        if (this._smoothXm === undefined || this._hoverAmount < 0.02) {
+          // opening from rest: grow right where the pointer is
+          this._smoothXm = xmRaw;
+        } else {
+          this._smoothXm += (xmRaw - this._smoothXm) * ease(ANIM_TAU_POINTER);
+        }
+      }
+      const target = hoverActive ? 1 : 0;
+      this._hoverAmount +=
+        (target - this._hoverAmount) *
+        ease(hoverActive ? ANIM_TAU_OPEN : ANIM_TAU_CLOSE);
+      if (Math.abs(target - this._hoverAmount) < 0.002) {
+        this._hoverAmount = target;
+      }
+      // keep the frame loop alive until the motion has settled
+      this._settling =
+        this._hoverAmount !== target ||
+        (hoverActive && Math.abs(xmRaw - this._smoothXm) > 0.25);
+      if (this._smoothXm === undefined) this._smoothXm = xmRaw;
+    }
+    const xmClamped = this._smoothXm;
+    const hoverAmount = this._hoverAmount;
+
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
-        if (!hoverActive) {
+        if (hoverAmount <= 0) {
             iconScales.push(1.0);
-            iconWidths.push(ICON_SIZE);
+            iconWidths.push(ICON_SIZE * slotOf(i));
         } else {
             const xi = staticCenters[i];
-            const scale = getScale(xi, xmClamped, threshold, scaleAtMax, curveType);
+            const full = getScale(xi, xmClamped, threshold, scaleAtMax, curveType);
+            const scale = 1.0 + (full - 1.0) * hoverAmount;
             iconScales.push(scale);
-            iconWidths.push(ICON_SIZE * scale);
+            iconWidths.push(ICON_SIZE * scale * slotOf(i));
         }
     }
 
@@ -403,24 +576,28 @@ export let Animator = class {
         if (i === 0) {
             currentPos = halfW;
         } else {
-            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding;
+            currentPos += iconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
         packedCenters.push(currentPos);
     }
     const activeL = packedCenters[TOTAL_CALC_ICONS - 1] + iconWidths[TOTAL_CALC_ICONS - 1] / 2;
 
-    // --- Step 4: Invariance-Targeted Variance Distribution ---
-    // Pre-calculate target packed dock length at dead center
+    // --- Step 4: Smooth Boundary Compensation (No Edge Wobble or Squish) ---
+    // At the left/right edges of the dock, part of the magnification bell
+    // extends onto the 4 imaginary boundary icons. Instead of cramming the
+    // missing width into the real icons (which squishes unmagnified icons
+    // together) or leaving it uncompensated (which shifts centeringShift and
+    // wobbles the dock), we absorb the variance evenly across all calculation
+    // nodes, AND absorb any residual real-span drift in the boundary imaginary
+    // icons so that realActiveL stays 100% invariant even across separators.
     const centerMouse = totalCalcStaticL / 2;
-    const centerScales = [];
     const centerWidths = [];
-    const activeHoverFactor = (hoverActive && !noAnimation) ? 1.0 : 0.0;
+    const activeHoverFactor = !noAnimation ? hoverAmount : 0.0;
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
         const xi = staticCenters[i];
         const targetScale = getScale(xi, centerMouse, threshold, scaleAtMax, curveType);
         const scale = 1.0 + (targetScale - 1.0) * activeHoverFactor;
-        centerScales.push(scale);
-        centerWidths.push(ICON_SIZE * scale);
+        centerWidths.push(ICON_SIZE * scale * slotOf(i));
     }
 
     let currentCenterPos = 0;
@@ -429,7 +606,7 @@ export let Animator = class {
         if (i === 0) {
             currentCenterPos = halfW;
         } else {
-            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding;
+            currentCenterPos += centerWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
     }
     const centerPackedL = currentCenterPos + centerWidths[TOTAL_CALC_ICONS - 1] / 2;
@@ -437,39 +614,17 @@ export let Animator = class {
     // Distribute length variance evenly across all calculation nodes
     const variance = centerPackedL - activeL;
     const adjustedIconWidths = [];
+    let slotSum = 0;
+    for (let i = 0; i < TOTAL_CALC_ICONS; i++) slotSum += slotOf(i);
     for (let i = 0; i < TOTAL_CALC_ICONS; i++) {
-        adjustedIconWidths.push(iconWidths[i] + variance / TOTAL_CALC_ICONS);
+        adjustedIconWidths.push(iconWidths[i] + (variance * slotOf(i)) / (slotSum || 1));
     }
 
-    // Save the unshifted realLeftEdge before applying the mouse-proximity shift to imaginary icons
     let realLeftEdgeUnshifted = 0;
     for (let i = 0; i < NUM_IMAGINARY; i++) {
         realLeftEdgeUnshifted += adjustedIconWidths[i];
     }
     realLeftEdgeUnshifted += NUM_IMAGINARY * activePadding;
-
-    /*
-    // --- Proportional Widening/Narrowing of Boundary Imaginary Icons ---
-    // Calculate normalized mouse position t on the unexpanded dock
-    const t = xmClamped / totalCalcStaticL;
-    // Calculate the unshifted real active length of the real icons
-    let realActiveLUnshifted = 0;
-    for (let i = NUM_IMAGINARY; i < NUM_IMAGINARY + NUM_ICONS; i++) {
-        realActiveLUnshifted += adjustedIconWidths[i];
-    }
-    realActiveLUnshifted += (NUM_ICONS - 1) * activePadding;
-
-    // Proportional shift based on mouse proximity to edge (pushes icons towards the mouse/center)
-    const shift = 1.0 * (0.5 - t) * (realActiveLUnshifted - restingL) * (hoverActive ? 1.0 : 0.0);
-
-    // Apply shift: widen the first imaginary icons and narrow the last imaginary icons (or vice versa)
-    for (let i = 0; i < NUM_IMAGINARY; i++) {
-        adjustedIconWidths[i] += shift / NUM_IMAGINARY;
-    }
-    for (let i = TOTAL_CALC_ICONS - NUM_IMAGINARY; i < TOTAL_CALC_ICONS; i++) {
-        adjustedIconWidths[i] -= shift / NUM_IMAGINARY;
-    }
-     */
 
     const adjustedPackedCenters = [];
     let adjCurrentPos = 0;
@@ -478,12 +633,12 @@ export let Animator = class {
         if (i === 0) {
             adjCurrentPos = halfW;
         } else {
-            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding;
+            adjCurrentPos += adjustedIconWidths[i - 1] / 2 + halfW + activePadding * slotOf(i) + gapOf(i);
         }
         adjustedPackedCenters.push(adjCurrentPos);
     }
 
-    // Extract the bounds of the 10 real icons from the 18 calculated nodes
+    // Extract the bounds of the real icons from the calculated nodes
     const realLeftEdge = adjustedPackedCenters[NUM_IMAGINARY] - adjustedIconWidths[NUM_IMAGINARY] / 2;
     const realRightEdge = adjustedPackedCenters[NUM_IMAGINARY + NUM_ICONS - 1] + adjustedIconWidths[NUM_IMAGINARY + NUM_ICONS - 1] / 2;
     const realActiveL = realRightEdge - realLeftEdge;
@@ -547,7 +702,8 @@ export let Animator = class {
         icon._scale = originalScale;
         icon._targetScale = originalScale;
 
-        // Compute secondary axis rise offset (elevation)
+        // Compute secondary axis rise offset (elevation) so the magnified wave
+        // pops conspicuously out of the dock like on macOS.
         const sz = iconSize * (originalScale - 1) * scaleFactor;
         icon._translateRise = sz * rise;
 
@@ -580,9 +736,9 @@ export let Animator = class {
     let first = animateIcons[0];
     let last = animateIcons[animateIcons.length - 1];
 
-    let slowDown = dock.extension._config.speed_up || 1;
-    if (!didScale) {
-      slowDown = 0.5;
+    // keep animating until the magnification has fully opened or closed
+    if (this._settling) {
+      didScale = true;
     }
 
     animateIcons.forEach((icon) => {
@@ -606,31 +762,12 @@ export let Animator = class {
       }
 
       //-------------------
-      // animate position
+      // commit position
       //-------------------
-      // High-performance Exponential Easing (LERP) for buttery-smooth and snappy transitions
-      {
-        let baseLerpFactor = 0.42 * slowDown; // 42% distance closed per 16.6ms frame (blazing fast!)
-        let factor = 1.0 - Math.pow(1.0 - baseLerpFactor, dt / 16.6);
-
-        // Handle edge boundary cases where dt is massive or invalid
-        if (isNaN(factor) || factor > 1.0) factor = 1.0;
-        if (factor < 0.0) factor = 0.0;
-
-        translationX = icon._icon.translationX + (translationX - icon._icon.translationX) * factor;
-        translationY = icon._icon.translationY + (translationY - icon._icon.translationY) * factor;
-      }
-
-      if (dock.extension.animation_fps > 0) {
-        icon._icon.translationX = translationX;
-        icon._icon.translationY = translationY;
-      } else {
-        //! retain this for smoothness at high fps
-        icon._icon.translationX =
-          (icon._icon.translationX + translationX * 3) / 4;
-        icon._icon.translationY =
-          (icon._icon.translationY + translationY * 3) / 4;
-      }
+      // no chasing here: the inputs of the layout are already smoothed
+      // (see Step 3), so the icons sit exactly where the layout puts them
+      icon._icon.translationX = translationX;
+      icon._icon.translationY = translationY;
 
       // clear bounce animation
       if (icon._appwell) {
@@ -723,25 +860,17 @@ export let Animator = class {
         //-------------------
         // animate scaling at renderer
         //-------------------
-        let unscaledIconSize = dock._iconSizeScaledDown * scaleFactor;
+        let innerScale =
+          dock.extension._config?.inner_icon_scale ??
+          dock.extension.inner_icon_scale ??
+          0.8;
+        let unscaledIconSize =
+          dock._iconSizeScaledDown * scaleFactor * innerScale;
         let targetSize = unscaledIconSize * icon._targetScale;
-        let currentSize = renderer.icon_size * renderer.scaleX;
-        {
-          let dst = targetSize - currentSize;
-          let mag = Math.abs(dst);
-          let dir = Math.sign(dst);
-          let accel = 0;
-          let pixelOverTime = ANIM_SIZE_PER_SEC * slowDown;
-          let deltaSize = pixelOverTime * dir * dt;
-          let appliedSize = deltaSize;
-          appliedSize += accel;
-          if (Math.abs(appliedSize) > mag) {
-            appliedSize = dst * 0.5;
-          }
-          targetSize = currentSize + appliedSize;
-          icon._deltaSize = appliedSize;
-          icon._targetSize = targetSize;
-        }
+        // the size follows the (already smoothed) layout directly, so that
+        // it always matches the icon's position
+        icon._deltaSize = 0;
+        icon._targetSize = targetSize;
         // compute icon scale based on size
         icon._scale = targetSize / unscaledIconSize;
 
@@ -751,19 +880,36 @@ export let Animator = class {
           renderer.set_icon_size(baseSize);
         }
         let scaleToTarget = targetSize / baseSize;
+        // swallow/pour animation of a window minimizing into this icon
+        icon._appliedPulse = icon._pulse || 1;
+        scaleToTarget *= icon._appliedPulse;
         renderer.set_scale(scaleToTarget, scaleToTarget);
+        if (icon._appliedPulse !== 1 && !icon._appwell?._bounce) {
+          let [tx, ty] = pulseOffset(
+            dock._position,
+            targetSize * (icon._appliedPulse - 1)
+          );
+          renderer.translationX = tx;
+          renderer.translationY = ty;
+        }
 
         let p = icon.get_transformed_position();
         let adjustX = icon.width / 2 - targetSize / 2;
         let adjustY = icon.height / 2 - targetSize / 2;
 
-        if (targetSize > icon.height) {
-          let rise = (targetSize - icon.height) * 0.5;
-          if (vertical) {
-            adjustX += rise * (dock._position == 'left' ? 1 : -1);
-          } else {
-            adjustY += rise * (dock._position == 'bottom' ? -1 : 1);
-          }
+        // True macOS bottom-anchored growth: the bottom (or dock-edge) of every
+        // icon stays on a single baseline regardless of scale, and the icon
+        // grows strictly outward from the dock edge.
+        if (vertical) {
+          adjustX =
+            dock._position == 'left'
+              ? icon.width / 2 - unscaledIconSize / 2
+              : icon.width / 2 + unscaledIconSize / 2 - targetSize;
+        } else {
+          adjustY =
+            dock._position == 'bottom'
+              ? icon.height / 2 + unscaledIconSize / 2 - targetSize
+              : icon.height / 2 - unscaledIconSize / 2;
         }
 
         //-------------------
@@ -773,34 +919,29 @@ export let Animator = class {
           let iconContainer = icon._icon.get_parent();
           // iconContainer can be null when dragging icons
           if (iconContainer) {
-            if (vertical) {
-              iconContainer.translationX = adjustX / 2;
-            } else {
-              iconContainer.translationY = adjustY / 2;
-            }
+            iconContainer.translationX = 0;
+            iconContainer.translationY = 0;
 
+            let rx = p[0] + adjustX + icon._icon.translationX - renderOffset[0];
             let ry = p[1] + adjustY + icon._icon.translationY - renderOffset[1];
-            renderer.set_position(
-              p[0] + adjustX + icon._icon.translationX - renderOffset[0],
-              ry
-            );
+            renderer.set_position(rx, ry);
 
-            // renderer.ease({
-            //   x: p[0] + adjustX + icon._icon.translationX - renderOffset[0],
-            //   y: ry,
-            //   duration: 100,
-            //   mode: Clutter.AnimationMode.LINEAR,
-            // });
-
-            // renderer.ease({
-            //   width: baseSize,
-            //   height: baseSize,
-            //   icon_size: baseSize,
-            //   duration: 200,
-            //   mode: Clutter.AnimationMode.LINEAR,
-            // });
+            // Running indicator dots stay anchored to the dock baseline, only
+            // shifting along the dock axis with the icon's horizontal center.
+            let unscaledAdjustX = icon.width / 2 - unscaledIconSize / 2;
+            let unscaledAdjustY = icon.height / 2 - unscaledIconSize / 2;
+            icon._dotX = vertical
+              ? p[0] + unscaledAdjustX - renderOffset[0]
+              : p[0] + unscaledAdjustX + icon._icon.translationX - renderOffset[0];
+            icon._dotY = vertical
+              ? p[1] + unscaledAdjustY + icon._icon.translationY - renderOffset[1]
+              : p[1] + unscaledAdjustY - renderOffset[1];
+            icon._unscaledIconSize = unscaledIconSize;
 
             renderer.visible = true;
+            renderer.reactive = animated && icon._scale > 1.02;
+            // e.g. the live picture of a minimized window drawn over its tile
+            icon._followRenderer?.(renderer);
           }
           icon._px = p[0] - renderOffset[0];
           icon._py = p[1] - renderOffset[1];
@@ -808,40 +949,38 @@ export let Animator = class {
 
         let hideLabel = true;
 
-        // label
+        // label: macOS-style instant appearance above the hovered icon.
+        // Never call icon._label.hide() / .show() here (only set opacity),
+        // because hiding/showing the label actor triggers a St/Clutter stage
+        // relayout that can perturb the Dash allocation.
+        let labelText = icon._labelText || icon._label?.text;
         if (
           !dock.extension.hide_labels &&
           icon === hoveredIcon &&
+          (icon._targetScale > 1 || magnify == 0) &&
           icon._label &&
-          icon._label.text &&
-          icon._label.text.length
+          labelText &&
+          labelText.length
         ) {
-          if (this._dwellIcon === icon) {
-            this._dwellTick += dt;
-            if (
-              this._dwellTick > 450 &&
-              (icon._targetScale > 1 || magnify == 0)
-            ) {
-              try {
-                hideLabel = false;
-                if (icon._label.opacity < 255 - 25) {
-                  icon._label.opacity += 25;
-                } else {
-                  icon._label.opacity = 255;
-                }
-              } catch (err) {
-                // label not ready?
-              }
+          try {
+            hideLabel = false;
+            if (icon._label.text !== labelText) {
+              icon._label.set_text(labelText);
             }
-          } else {
-            this._dwellTick = 0;
+            icon._label.remove_all_transitions?.();
+            if (!icon._label.visible) {
+              icon._label.show();
+            }
+            icon._label.opacity = 255;
+          } catch (err) {
+            // label not ready?
           }
           this._dwellIcon = icon;
-
           this.alignLabel(icon);
         }
 
         if (hideLabel && icon._label) {
+          icon._label.remove_all_transitions?.();
           icon._label.opacity = 0;
         }
 
@@ -916,11 +1055,11 @@ export let Animator = class {
             dock,
           });
 
-          dots.width = icon._renderer.width * icon._renderer.scaleX;
+          dots.width = icon._unscaledIconSize || icon._renderer.width * icon._renderer.scaleX;
           dots.height = dots.width;
-          dots.x = icon._renderer.x;
-          dots.y = icon._renderer.y;
-          dots.set_scale(icon._scale, icon._scale);
+          dots.x = icon._dotX ?? icon._renderer.x;
+          dots.y = icon._dotY ?? icon._renderer.y;
+          dots.set_scale(1, 1);
           dots.show();
         }
       }
@@ -935,31 +1074,92 @@ export let Animator = class {
       }
     });
 
-    // separators
-    dock._separators.forEach((actor) => {
-      let prev = actor._prev; // get_previous_sibling() || actor._prev;
-      let next = actor._next; // get_next_sibling();
-      if (prev && next && prev._icon && next._icon) {
-        actor.translationX =
-          (prev._icon.translationX + next._icon.translationX) / 2;
-        actor.translationY =
-          (prev._icon.translationY + next._icon.translationY) / 2;
-        let thickness = dock.extension.separator_thickness || 0;
-        if (vertical) {
-          actor.width = iconSize * 0.5 * scaleFactor;
-          actor.height = thickness + 0.5;
-        } else {
-          actor.width = thickness + 0.5;
-          actor.height = iconSize * 0.75 * scaleFactor;
+    // separators: a thin line in the middle of the gap between its two icons,
+    // on whole pixels so that it stays sharp
+    (dock._separators ?? []).forEach((actor) => {
+      // the Shell destroys its separator when it is no longer needed
+      if (actor._d2daDestroyed || !actor.get_parent()) return;
+
+      // size and visibility do not depend on the neighbours, so a separator
+      // missing one never keeps a stale size or stays hidden
+      let thickness = sepThickness;
+      // as tall as the drawn icons, like on macOS
+      let length = Math.round(ICON_SIZE * innerScale);
+      if (vertical) {
+        actor.width = length;
+        actor.height = thickness;
+      } else {
+        actor.width = thickness;
+        actor.height = length;
+      }
+      // two separators with no icon between them (the Shell's, with no
+      // running app after it, and ours before the folders) show as one
+      let prev = neighbour(actor, '_prev');
+      let next = neighbour(actor, '_next');
+      let duplicate = prev && next && !shownSeparators.includes(actor);
+      let shouldShow = thickness > 0 && !duplicate;
+      actor.opacity = shouldShow ? 255 : 0;
+      if (!shouldShow) {
+        // collapse the duplicate separator's width & margins without hiding
+        // it (`actor.visible = false` triggers a synchronous StBoxLayout
+        // relayout mid-frame that shifts icon positions by SEP_GAP)
+        actor.width = 0;
+        actor.height = 0;
+        if (actor._d2daSepStyle !== 'margin: 0px;') {
+          actor._d2daSepStyle = 'margin: 0px;';
+          actor.style = 'margin: 0px;';
         }
-        actor.visible = thickness > 0;
+        return;
+      }
+      if (!actor.visible) actor.visible = true;
+
+      // its layout takes the same room as its gap in the packing, so that the
+      // dock keeps its length
+      let margin = Math.max(0, (SEP_GAP - thickness) / 2);
+      let style = vertical
+        ? `margin-top: ${margin}px; margin-bottom: ${margin}px;`
+        : `margin-left: ${margin}px; margin-right: ${margin}px;`;
+      if (actor._d2daSepStyle !== style) {
+        actor._d2daSepStyle = style;
+        actor.style = style;
       }
 
+      let ax = vertical ? 1 : 0;
+      // where the separator is laid out, without its translation
+      let [lx, ly] = actor.get_transformed_position();
+      let layoutPos = (vertical ? ly : lx) - (vertical ? actor.translationY : actor.translationX);
+      let target = null;
+      if (prev && next && shownSeparators.includes(actor)) {
+        // between the drawn edges of its neighbours (they may be magnified)
+        let [pp, ps] = [prev._icon.get_transformed_position(), prev._icon.get_transformed_size()];
+        let np = next._icon.get_transformed_position();
+        target = (pp[ax] + ps[ax] + np[ax]) / 2 - thickness / 2;
+      } else if (prev || next) {
+        // at an end of the dock: follow the one neighbour there is
+        let only = (prev ?? next)._icon;
+        target = layoutPos + (vertical ? only.translationY : only.translationX);
+      }
+      if (target !== null && !isNaN(target) && !isNaN(layoutPos)) {
+        let t = Math.round(target) - layoutPos;
+        if (vertical) actor.translationY = t;
+        else actor.translationX = t;
+      }
+
+      // across the dock: centered on its neighbour's slot (the layout already
+      // centers it in the row, but the row can be taller than the icons)
       let any = next ?? prev;
-      if (!vertical && any) {
-        actor.translationY = any.height / 2 - actor.height / 2;
-      } else if (vertical && any) {
-        // actor.translationX = any.width / 2 - actor.width / 2;
+      if (any) {
+        let cross = vertical ? 0 : 1;
+        let [anyX, anyY] = any.get_transformed_position();
+        let anyPos = cross ? anyY : anyX;
+        let anySize = cross ? any.height : any.width;
+        let ownSize = cross ? actor.height : actor.width;
+        let ownPos = (cross ? ly : lx) - (cross ? actor.translationY : actor.translationX);
+        let t = Math.round(anyPos + anySize / 2 - ownSize / 2) - ownPos;
+        if (!isNaN(t)) {
+          if (cross) actor.translationY = t;
+          else actor.translationX = t;
+        }
       }
     });
 
@@ -1019,6 +1219,9 @@ export let Animator = class {
       let speed =
         ((150 + 300 * dock.extension.autohide_speed * scaleFactor) / 1000) *
         autohide_slowDown;
+      // the share above was tuned for one step every 15 ms: keep the same
+      // pace whatever the frame rate
+      speed = 1 - Math.pow(1 - Math.min(1, speed), (dt || 15) / 15);
 
       let v1 = new Vector([targetX, targetY, 0]);
       let v2 = new Vector([dock.dash.translationX, dock.dash.translationY, 0]);
@@ -1052,12 +1255,16 @@ export let Animator = class {
       // allied areas
       //! this should be at the layout -- make independent of background
       // struts
+      // a docked (not autohidden) dock keeps windows as far above it as it
+      // floats above the screen edge, like on macOS (the background reaches
+      // 1.5 paddings beyond the icons, see DockBackground.update)
+      const floatGap = Math.max(0, edge_distance - 1.5 * dock._background._padding);
+      const keepAway = (size) =>
+        dock.extension.autohide_dash
+          ? size + iconSize * 0.2 * scaleFactor + edge_distance - dock._background._padding * scaleFactor
+          : size + 2 * floatGap;
       if (vertical) {
-        dock.struts.width =
-          dock._background.width +
-          iconSize * 0.2 * scaleFactor +
-          edge_distance -
-          dock._background._padding * scaleFactor;
+        dock.struts.width = keepAway(dock._background.width);
         dock.struts.height = dock.height;
 
         if (dock.extension.autohide_dash) {
@@ -1075,11 +1282,7 @@ export let Animator = class {
         }
       } else {
         dock.struts.width = dock.width;
-        dock.struts.height =
-          dock._background.height +
-          iconSize * 0.2 * scaleFactor +
-          edge_distance -
-          dock._background._padding * scaleFactor;
+        dock.struts.height = keepAway(dock._background.height);
 
         if (dock.extension.autohide_dash) {
           dock.struts.x = dock._background.x + dock._monitor.x;
@@ -1128,7 +1331,24 @@ export let Animator = class {
     if (!dock) return;
 
     let tPos, tSize;
-    if (renderer) {
+    let renderOffset = dock.renderArea?.get_transformed_position?.();
+    if (
+      renderer &&
+      renderOffset &&
+      !isNaN(renderOffset[0]) &&
+      !isNaN(renderOffset[1])
+    ) {
+      // Compute the exact visual bounds of the renderer from its stage
+      // position and scale, instead of get_transformed_position()/size() which
+      // can read pre-allocation or pivot-skewed boxes on the same frame.
+      let rw = renderer.width * renderer.scaleX;
+      let rh = renderer.height * renderer.scaleY;
+      tSize = [rw, rh];
+      tPos = [
+        renderOffset[0] + renderer.x + renderer.translationX,
+        renderOffset[1] + renderer.y + renderer.translationY,
+      ];
+    } else if (renderer) {
       tSize = renderer.get_transformed_size();
       tPos = renderer.get_transformed_position();
     } else {
@@ -1144,19 +1364,20 @@ export let Animator = class {
     let sw = !isNaN(tSize[0]) ? tSize[0] : 0;
     let sh = !isNaN(tSize[1]) ? tSize[1] : 0;
 
-    let lsz = icon._label.get_transformed_size();
-    let lw = !isNaN(lsz[0]) && lsz[0] > 0 ? lsz[0] : 0;
-    let lh = !isNaN(lsz[1]) && lsz[1] > 0 ? lsz[1] : 0;
+    let lw = 0;
+    let lh = 0;
+    try {
+      let [, natW] = icon._label.get_preferred_width(-1);
+      let [, natH] = icon._label.get_preferred_height(natW);
+      lw = natW || 0;
+      lh = natH || 0;
+    } catch {
+      // fallback below
+    }
     if (!lw || !lh) {
-      try {
-        let [, natW] = icon._label.get_preferred_width(-1);
-        let [, natH] = icon._label.get_preferred_height(natW);
-        lw = lw || natW || icon._label.width || 0;
-        lh = lh || natH || icon._label.height || 0;
-      } catch {
-        lw = lw || icon._label.width || 0;
-        lh = lh || icon._label.height || 0;
-      }
+      let lsz = icon._label.get_transformed_size();
+      lw = lw || (!isNaN(lsz[0]) && lsz[0] > 0 ? lsz[0] : icon._label.width || 0);
+      lh = lh || (!isNaN(lsz[1]) && lsz[1] > 0 ? lsz[1] : icon._label.height || 0);
     }
 
     let lx = tPos[0] + sw / 2 - lw / 2;
@@ -1166,28 +1387,71 @@ export let Animator = class {
     let m = dock._monitor;
     let scale = m?.geometry_scale || 1;
 
+    const gap = 8 * scale;
     if (vertical) {
       if (dock._position == DockPosition.LEFT) {
-        lx += sh / 1.5 + lw / 2;
+        lx = tPos[0] + sw + gap;
       } else {
-        lx -= sh / 1.5 + lw / 2;
+        lx = tPos[0] - lw - gap;
       }
-      ly += 2 * scale;
+      ly = tPos[1] + sh / 2 - lh / 2;
     } else {
-      let magnify = dock.extension.animation_magnify;
-      if (magnify == 0 || dock._iconSize <= 4) {
-        sh *= 1.5;
-      }
+      lx = tPos[0] + sw / 2 - lw / 2;
       if (dock._position == DockPosition.BOTTOM) {
-        ly -= sh / 1.25;
+        ly = tPos[1] - lh - gap;
       } else {
-        ly += sh / 1.25;
+        ly = tPos[1] + sh + gap;
       }
-      lx += 2 * scale;
     }
 
     icon._label.x = Math.round(lx);
     icon._label.y = Math.round(ly);
+  }
+
+  /// Makes the dock icon of a window swell and settle back, as if swallowing the window
+  /// (minimize) or pouring it out (unminimize). Synchronized with the magic lamp effect.
+  pulseIcon(meta_window, { delay = 0, duration = 320, amount = 0.14 } = {}) {
+    let dock = this.dock;
+    let base = null;
+
+    const apply = (p) => {
+      if (!this._target || dock._dragging) return;
+      let icon = dock.findIconForWindow(meta_window);
+      let renderer = icon?._renderer;
+      if (!renderer) return;
+
+      // while the main loop runs it applies icon._pulse itself
+      let mainLoopActive = Date.now() - (this._lastAnimateTime || 0) < 60;
+      let applied = icon._appliedPulse || 1;
+      if (base === null) base = renderer.scaleX / applied;
+      let baseScale = mainLoopActive ? renderer.scaleX / applied : base;
+      icon._pulse = p;
+      if (!mainLoopActive) {
+        renderer.set_scale(baseScale * p, baseScale * p);
+        icon._appliedPulse = p;
+      }
+
+      // grow from the edge the dock is attached to (the main loop does it itself)
+      if (!mainLoopActive) {
+        let [tx, ty] = pulseOffset(
+          dock._position,
+          renderer.width * baseScale * (p - 1)
+        );
+        renderer.translationX = tx;
+        renderer.translationY = ty;
+      }
+    };
+
+    const bump = (f) => {
+      let t = Math.min(1, f._time / f._duration);
+      apply(t >= 0.98 ? 1 : 1 + amount * Math.sin(Math.PI * t));
+    };
+
+    let frames = [];
+    if (delay > 0) frames.push({ _duration: delay, _func: () => {} });
+    frames.push({ _duration: duration, _func: bump });
+    frames.push({ _duration: 60, _func: () => apply(1) });
+    dock.extension._hiTimer.runAnimation(frames);
   }
 
   bounceIcon(appwell) {
