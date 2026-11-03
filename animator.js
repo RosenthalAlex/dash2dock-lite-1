@@ -693,21 +693,35 @@ export let Animator = class {
     dock._hoveredIcon = nearestIcon;
 
     // DND icon reordering animation (macOS style smooth slide)
+    const draggedAppId = dock._dragged?._appwell
+      ? Compat.getAppId(dock._dragged._appwell)
+      : null;
+
     if (dock._dragging && dock._dragged) {
       const favIcons = animateIcons.filter(
         (icon) =>
           icon._appwell &&
+          icon !== Compat.getDashShowAppsIcon(dock.dash) &&
           dock._favorite_ids?.includes(Compat.getAppId(icon._appwell))
       );
-      const draggedIndex = favIcons.indexOf(dock._dragged);
+      const draggedIndex = favIcons.findIndex(
+        (icon) =>
+          icon === dock._dragged ||
+          icon._icon === dock._dragged ||
+          (draggedAppId &&
+            icon._appwell &&
+            Compat.getAppId(icon._appwell) === draggedAppId)
+      );
 
       if (draggedIndex !== -1 && favIcons.length > 1) {
+        const cursorVal = vertical ? py : px;
         let bestDist = Infinity;
         let targetIndex = draggedIndex;
         favIcons.forEach((icon, i) => {
-          const calcIndex = animateIcons.indexOf(icon) + NUM_IMAGINARY;
-          const staticCenter = staticCenters[calcIndex] + unwarpedActiveStartX;
-          const dist = Math.abs(primaryMouse - staticCenter);
+          const iconCenter = vertical
+            ? icon._fixedPosition[1] + icon.height / 2
+            : icon._fixedPosition[0] + icon.width / 2;
+          const dist = Math.abs(cursorVal - iconCenter);
           if (dist < bestDist) {
             bestDist = dist;
             targetIndex = i;
@@ -716,14 +730,18 @@ export let Animator = class {
 
         dock._dndTargetIndex = targetIndex;
 
-        const slotWidth = activeContainerWidth;
+        const slotWidth =
+          Math.abs(
+            (vertical ? favIcons[1]._fixedPosition[1] : favIcons[1]._fixedPosition[0]) -
+            (vertical ? favIcons[0]._fixedPosition[1] : favIcons[0]._fixedPosition[0])
+          ) || activeContainerWidth;
         const speed = dock.extension._config?.speed_up || 1;
         const ease = 1 - Math.exp(-(dt || 16.6) * speed / 40.0);
 
         favIcons.forEach((icon, i) => {
           let desiredOffset = 0;
           if (i === draggedIndex) {
-            desiredOffset = 0;
+            desiredOffset = (targetIndex - draggedIndex) * slotWidth;
           } else if (targetIndex > draggedIndex && i > draggedIndex && i <= targetIndex) {
             desiredOffset = -slotWidth;
           } else if (targetIndex < draggedIndex && i < draggedIndex && i >= targetIndex) {
@@ -1024,6 +1042,7 @@ export let Animator = class {
         // relayout that can perturb the Dash allocation.
         let labelText = icon._labelText || icon._label?.text;
         if (
+          !dock._dragging &&
           !dock.extension.hide_labels &&
           icon === hoveredIcon &&
           (icon._targetScale > 1 || magnify == 0) &&
@@ -1055,9 +1074,13 @@ export let Animator = class {
 
         if (
           dock._dragging &&
-          (icon === dock._dragged || icon._icon === dock._dragged)
+          (icon === dock._dragged ||
+            icon._icon === dock._dragged ||
+            (draggedAppId &&
+              icon._appwell &&
+              Compat.getAppId(icon._appwell) === draggedAppId))
         ) {
-          renderer.opacity = 0;
+          renderer.opacity = 45;
         } else {
           renderer.opacity = 255;
         }

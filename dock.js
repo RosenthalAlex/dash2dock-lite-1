@@ -6,6 +6,7 @@ import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import * as Compat from './compat.js';
 
 import Shell from 'gi://Shell';
+import Meta from 'gi://Meta';
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
@@ -456,8 +457,7 @@ export let Dock = GObject.registerClass(
         targetPos = 0;
       }
 
-      const laters = global.compositor.get_laters();
-      laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+      GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
         try {
           if (srcIsFavorite) {
             appFavorites.moveFavoriteToPos(id, targetPos);
