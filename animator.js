@@ -285,7 +285,7 @@ export let Animator = class {
     let wasAnimated = Boolean(dock.animated);
     let isWithin = dock._isWithinDash([px, py]);
 
-    if (m.inFullscreen) {
+    if (m.inFullscreen && !Main.overview.visible) {
       isWithin = false;
     }
 
@@ -478,7 +478,7 @@ export let Animator = class {
       isWithinPrimary &&
       (isWithinSecondary ||
         (wasAnimated && dock._isWithinMagnifiedIcons([px, py])));
-    if (m.inFullscreen) {
+    if (m.inFullscreen && !Main.overview.visible) {
         isWithin = false;
     }
     animated = isWithin;

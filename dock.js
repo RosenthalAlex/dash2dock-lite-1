@@ -336,14 +336,14 @@ export let Dock = GObject.registerClass(
     }
 
     _onMotionEvent(evt) {
-      if (!this._monitor.inFullscreen) {
+      if (!this._monitor.inFullscreen || Main.overview.visible) {
         this._beginAnimation();
       }
       this.autohider._debounceCheckHide();
       return Clutter.EVENT_PROPAGATE;
     }
     _onEnterEvent(evt) {
-      if (!this._monitor.inFullscreen) {
+      if (!this._monitor.inFullscreen || Main.overview.visible) {
         this._beginAnimation();
       }
       return Clutter.EVENT_PROPAGATE;

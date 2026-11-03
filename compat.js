@@ -318,6 +318,7 @@ export function setOverviewDashVisibility(overviewDash, show, state = null) {
   if (!overviewDash) return;
   try {
     overviewDash.opacity = show ? 255 : 0;
+    overviewDash.reactive = show;
     const bg = getDashBackground(overviewDash);
     if (bg) {
       bg.style = show ? '' : 'background: transparent !important;';

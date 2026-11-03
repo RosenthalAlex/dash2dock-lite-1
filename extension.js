@@ -982,6 +982,27 @@ export default class Dash2DockLiteExt extends Extension {
     });
   }
 
+  _onOverviewMotionEvent(actor, event) {
+    if (!this._inOverview) return Clutter.EVENT_PROPAGATE;
+    let pointer = global.get_pointer();
+    let isOverAnyDock = false;
+    for (const dock of this.docks) {
+      if (dock._isWithinDash(pointer)) {
+        isOverAnyDock = true;
+        dock._beginAnimation('overview-hover');
+      }
+    }
+    if (!isOverAnyDock) {
+      for (const dock of this.docks) {
+        if (dock.animated) {
+          dock._beginAnimation('overview-leave');
+          dock._debounceEndAnimation();
+        }
+      }
+    }
+    return Clutter.EVENT_PROPAGATE;
+  }
+
   _onOverviewShowing() {
     this._showMainOverviewDash(false);
     //this._loTimer.runOnce(() => { Main.overview.dash.set_height(1); }, 50);
@@ -989,13 +1010,24 @@ export default class Dash2DockLiteExt extends Extension {
     this._autohiders().forEach((autohider) => {
       autohider._debounceCheckHide();
     });
-    this.animate();
     this.docks.forEach((dock) => {
       dock._updateTransparenies();
+      if (dock.get_parent() === Main.uiGroup) {
+        Main.uiGroup.set_child_above_sibling(dock, null);
+      }
     });
+
+    global.stage.connectObject(
+      'motion-event',
+      this._onOverviewMotionEvent.bind(this),
+      this
+    );
+
+    this.animate();
   }
 
   _onOverviewHidden() {
+    global.stage.disconnectObject(this);
     //Main.overview.dash.set_height(1);
     this._inOverview = false;
     this._autohiders().forEach((autohider) => {
@@ -1003,7 +1035,14 @@ export default class Dash2DockLiteExt extends Extension {
     });
     this.docks.forEach((dock) => {
       dock._updateTransparenies();
+      if (
+        dock.get_parent() === Main.uiGroup &&
+        Main.uiGroup.contains(global.top_window_group)
+      ) {
+        Main.uiGroup.set_child_below_sibling(dock, global.top_window_group);
+      }
     });
+    this.animate();
   }
 
   _onSessionUpdated() {
