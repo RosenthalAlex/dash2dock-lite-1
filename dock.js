@@ -418,7 +418,7 @@ export let Dock = GObject.registerClass(
     }
 
     handleDragOver(source, actor, x, y, time) {
-      if (!this.dash || !this.dash._box) {
+      if (!this.dash) {
         return DND.DragMotionResult.NO_DROP;
       }
 
@@ -432,79 +432,51 @@ export let Dock = GObject.registerClass(
       }
 
       this._dragging = true;
-
-      let favItems = (this._icons ?? []).filter((c) => {
-        if (c._isDragPlaceholder) return false;
-        if (!c._appwell) return false;
-        let id = Compat.getAppId(c._appwell);
-        return this._favorite_ids?.includes(id);
-      });
-
-      let numFavorites = favItems.length;
-      let targetPos = numFavorites;
-
-      let [stageX, stageY] = this.get_transformed_position();
-      let pointerVal = this.isVertical() ? stageY + y : stageX + x;
-
-      for (let i = 0; i < numFavorites; i++) {
-        let item = favItems[i];
-        let itemPos = item.get_transformed_position();
-        let center = this.isVertical()
-          ? (item._renderer?.y ?? itemPos[1]) + (item._renderer?.height ?? item.height) / 2
-          : (item._renderer?.x ?? itemPos[0]) + (item._renderer?.width ?? item.width) / 2;
-        if (pointerVal < center) {
-          targetPos = i;
-          break;
-        }
-      }
-
-      let box = this.dash._box;
-      let numChildren = Math.max(1, box.get_children().length);
-      let boxWidth = Math.max(1, box.width);
-      let mappedX = (targetPos + 0.5) * (boxWidth / numChildren);
-
-      return this.dash.handleDragOver(source, actor, mappedX, 0, time);
+      this._beginAnimation();
+      return DND.DragMotionResult.MOVE_DROP;
     }
 
     acceptDrop(source, actor, x, y, time) {
-      if (!this.dash || !this.dash._box) {
+      const app = Dash.getAppFromSource(source);
+      if (!app || app.is_window_backed()) {
         return false;
       }
 
-      let favItems = (this._icons ?? []).filter((c) => {
-        if (c._isDragPlaceholder) return false;
-        if (!c._appwell) return false;
-        let id = Compat.getAppId(c._appwell);
-        return this._favorite_ids?.includes(id);
-      });
-
-      let numFavorites = favItems.length;
-      let targetPos = numFavorites;
-
-      let [stageX, stageY] = this.get_transformed_position();
-      let pointerVal = this.isVertical() ? stageY + y : stageX + x;
-
-      for (let i = 0; i < numFavorites; i++) {
-        let item = favItems[i];
-        let itemPos = item.get_transformed_position();
-        let center = this.isVertical()
-          ? (item._renderer?.y ?? itemPos[1]) + (item._renderer?.height ?? item.height) / 2
-          : (item._renderer?.x ?? itemPos[0]) + (item._renderer?.width ?? item.width) / 2;
-        if (pointerVal < center) {
-          targetPos = i;
-          break;
-        }
+      if (!global.settings.is_writable('favorite-apps')) {
+        return false;
       }
 
-      let box = this.dash._box;
-      let numChildren = Math.max(1, box.get_children().length);
-      let boxWidth = Math.max(1, box.width);
-      let mappedX = (targetPos + 0.5) * (boxWidth / numChildren);
+      const id = app.get_id();
+      const appFavorites = Fav.getAppFavorites();
+      const favorites = appFavorites.getFavoriteMap();
+      const srcIsFavorite = id in favorites;
 
-      let result = this.dash.acceptDrop(source, actor, mappedX, 0, time);
+      let targetPos = this._dndTargetIndex;
+      if (targetPos === undefined || targetPos === null || targetPos < 0) {
+        targetPos = 0;
+      }
+
+      const laters = global.compositor.get_laters();
+      laters.add(Meta.LaterType.BEFORE_REDRAW, () => {
+        try {
+          if (srcIsFavorite) {
+            appFavorites.moveFavoriteToPos(id, targetPos);
+          } else {
+            appFavorites.addFavoriteAtPos(id, targetPos);
+          }
+        } catch (e) {
+          console.error('d2da: acceptDrop moveFavorite', e);
+        }
+        return GLib.SOURCE_REMOVE;
+      });
+
       this._dragging = false;
       this._lastDragEndTime = Date.now();
-      return result;
+      this._dndTargetIndex = null;
+      this._icons = null;
+      this._needsLayout = true;
+      this._beginAnimation();
+      return true;
     }
     _onMonitorsChanged() {
       this._needsLayout = true;
@@ -870,21 +842,6 @@ export let Dock = GObject.registerClass(
         return false;
       }
 
-      /* DragPlaceholderItem */
-      if (
-        c.constructor?.name === 'DragPlaceholderItem' ||
-        c.child?.has_style_class_name?.('placeholder')
-      ) {
-        c._isDragPlaceholder = true;
-        c._icon = c.child ?? c;
-        c._icon.opacity = 0;
-        c._icon.reactive = false;
-        c._slotFactor ??= 0.0;
-        this._icons.push(c);
-        this._dashItems.push(c);
-        return true;
-      }
-
       /* ShowAppsIcon */
       if (c.icon /* BaseIcon or old IconGrid */) {
         let stIcon = Compat.getStIcon(c) ?? c.icon.icon;
@@ -1206,11 +1163,8 @@ export let Dock = GObject.registerClass(
           _draggable._dragEndId = _draggable.connect('drag-end', () => {
             this._dragging = false;
             this._lastDragEndTime = Date.now();
-            this.dash?._clearDragPlaceholder?.();
-            if (this._dragged) {
-              this._dragged._slotFactor = undefined;
-            }
             this._dragged = null;
+            this._dndTargetIndex = null;
             this._icons = null;
             this._needsLayout = true;
             this._beginAnimation();

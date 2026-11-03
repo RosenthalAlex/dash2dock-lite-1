@@ -314,15 +314,7 @@ export let Animator = class {
     animateIcons.forEach((icon) => {
       if (!icon._icon) return;
       let pos = icon.get_transformed_position();
-      if (!pos || isNaN(pos[0]) || isNaN(pos[1])) {
-        if (icon._isDragPlaceholder) {
-          pos = prevIcon?._fixedPosition
-            ? [...prevIcon._fixedPosition]
-            : [dock.x, dock.y];
-        } else {
-          return;
-        }
-      }
+      if (!pos || isNaN(pos[0]) || isNaN(pos[1])) return;
       positionedIcons.push(icon);
 
       if (icon._found && !icon._handled) {
@@ -350,38 +342,6 @@ export let Animator = class {
     if (!animateIcons.length) {
       return;
     }
-
-    let hasPlaceholder = animateIcons.some((icon) => icon._isDragPlaceholder);
-    animateIcons.forEach((icon) => {
-      if (icon._isDragPlaceholder) {
-        if (icon._slotFactor === undefined) icon._slotFactor = 0.0;
-        if (icon._slotFactor < 1.0) {
-          let step = (dt || 16.6) / 120.0;
-          icon._slotFactor = Math.min(1.0, icon._slotFactor + step);
-          this._settling = true;
-        }
-      } else if (
-        dock._dragging &&
-        (icon === dock._dragged || icon._icon === dock._dragged) &&
-        icon._appwell &&
-        dock._favorite_ids?.includes(Compat.getAppId(icon._appwell))
-      ) {
-        if (hasPlaceholder) {
-          if (icon._slotFactor === undefined) icon._slotFactor = 1.0;
-          if (icon._slotFactor > 0.0) {
-            let step = (dt || 16.6) / 120.0;
-            icon._slotFactor = Math.max(0.0, icon._slotFactor - step);
-            this._settling = true;
-          }
-        } else {
-          if (icon._slotFactor !== undefined && icon._slotFactor < 1.0) {
-            let step = (dt || 16.6) / 120.0;
-            icon._slotFactor = Math.min(1.0, icon._slotFactor + step);
-            this._settling = true;
-          }
-        }
-      }
-    });
 
     let noAnimation = !dock.extension.animate_icons_unmute;
     if (dock._dragging) {
@@ -732,6 +692,67 @@ export let Animator = class {
     dock._nearestIcon = nearestIcon;
     dock._hoveredIcon = nearestIcon;
 
+    // DND icon reordering animation (macOS style smooth slide)
+    if (dock._dragging && dock._dragged) {
+      const favIcons = animateIcons.filter(
+        (icon) =>
+          icon._appwell &&
+          dock._favorite_ids?.includes(Compat.getAppId(icon._appwell))
+      );
+      const draggedIndex = favIcons.indexOf(dock._dragged);
+
+      if (draggedIndex !== -1 && favIcons.length > 1) {
+        let bestDist = Infinity;
+        let targetIndex = draggedIndex;
+        favIcons.forEach((icon, i) => {
+          const calcIndex = animateIcons.indexOf(icon) + NUM_IMAGINARY;
+          const staticCenter = staticCenters[calcIndex] + unwarpedActiveStartX;
+          const dist = Math.abs(primaryMouse - staticCenter);
+          if (dist < bestDist) {
+            bestDist = dist;
+            targetIndex = i;
+          }
+        });
+
+        dock._dndTargetIndex = targetIndex;
+
+        const slotWidth = activeContainerWidth;
+        const speed = dock.extension._config?.speed_up || 1;
+        const ease = 1 - Math.exp(-(dt || 16.6) * speed / 40.0);
+
+        favIcons.forEach((icon, i) => {
+          let desiredOffset = 0;
+          if (i === draggedIndex) {
+            desiredOffset = 0;
+          } else if (targetIndex > draggedIndex && i > draggedIndex && i <= targetIndex) {
+            desiredOffset = -slotWidth;
+          } else if (targetIndex < draggedIndex && i < draggedIndex && i >= targetIndex) {
+            desiredOffset = slotWidth;
+          }
+
+          icon._dndOffset ??= 0;
+          icon._dndOffset += (desiredOffset - icon._dndOffset) * ease;
+          if (Math.abs(desiredOffset - icon._dndOffset) < 0.2) {
+            icon._dndOffset = desiredOffset;
+          } else {
+            this._settling = true;
+          }
+        });
+      }
+    } else {
+      animateIcons.forEach((icon) => {
+        if (icon._dndOffset) {
+          const ease = 1 - Math.exp(-(dt || 16.6) / 40.0);
+          icon._dndOffset += (0 - icon._dndOffset) * ease;
+          if (Math.abs(icon._dndOffset) < 0.2) {
+            icon._dndOffset = 0;
+          } else {
+            this._settling = true;
+          }
+        }
+      });
+    }
+
     animateIcons.forEach((icon, idx) => {
         if (!icon._icon) return;
 
@@ -742,7 +763,7 @@ export let Animator = class {
         icon._visualCenter = visualCenter;
 
         // Position the Clutter actor perfectly using 1D packing relative to its resting center
-        icon._translate = activeCenter + centeringShift - restingCenters[idx];
+        icon._translate = activeCenter + centeringShift - restingCenters[idx] + (icon._dndOffset || 0);
 
         // Assign unadjusted original scale to the actor properties
         const originalScale = iconScales[calcIndex];
@@ -1032,17 +1053,11 @@ export let Animator = class {
           icon._label.opacity = 0;
         }
 
-        if (icon._isDragPlaceholder) {
-          renderer.opacity = 0;
-          renderer.visible = false;
-          if (icon._label) {
-            icon._label.opacity = 0;
-          }
-        } else if (
+        if (
           dock._dragging &&
           (icon === dock._dragged || icon._icon === dock._dragged)
         ) {
-          renderer.opacity = hasPlaceholder ? 0 : 40;
+          renderer.opacity = 0;
         } else {
           renderer.opacity = 255;
         }
@@ -1055,7 +1070,7 @@ export let Animator = class {
       let badge = this._badges[icon._idx];
       icon._badge = badge;
       badge.hide();
-      if (icon != dock._dragged && !icon._isDragPlaceholder) {
+      if (icon != dock._dragged) {
         let appNotices = icon._appwell
           ? dock.extension.services._appNotices[icon._appwell.app.get_id()]
           : null;
@@ -1099,7 +1114,6 @@ export let Animator = class {
       dots.hide();
       if (
         icon != dock._dragged &&
-        !icon._isDragPlaceholder &&
         icon._appwell &&
         icon._appwell.app &&
         icon._appwell.app.get_n_windows
