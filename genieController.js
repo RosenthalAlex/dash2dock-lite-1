@@ -130,7 +130,17 @@ export const GenieController = class {
     const rect = this._rectOf(icon);
     if (rect) return rect;
     const m = dock._monitor ?? Main.layoutManager.primaryMonitor;
-    return { x: m.x + m.width / 2 - 24, y: m.y + m.height - 48, width: 48, height: 48 };
+    const size = dock._itemSize || 48;
+    switch (dock._position) {
+      case 'top':
+        return { x: m.x + m.width / 2 - size / 2, y: m.y, width: size, height: size };
+      case 'left':
+        return { x: m.x, y: m.y + m.height / 2 - size / 2, width: size, height: size };
+      case 'right':
+        return { x: m.x + m.width - size, y: m.y + m.height / 2 - size / 2, width: size, height: size };
+      default:
+        return { x: m.x + m.width / 2 - size / 2, y: m.y + m.height - size, width: size, height: size };
+    }
   }
 
   _start(actor, minimize) {

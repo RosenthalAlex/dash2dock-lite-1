@@ -86,6 +86,13 @@ export const GenieEffect = GObject.registerClass(
       const T = this._T;
       if (!W || !T) return;
 
+      // Under fractional scaling or HiDPI, ClutterDeformEffect's offscreen FBO texture has physical
+      // pixel dimensions (width/height = source.size * resource_scale), and Clutter scales the
+      // deformed FBO matrix by (1 / resource_scale) on paint. Converting logical stage displacements
+      // into FBO vertex space ensures the animation lands at 1:1 stage coordinates at any scale.
+      const propX = this._source.width > 0 ? width / this._source.width : 1;
+      const propY = this._source.height > 0 ? height / this._source.height : 1;
+
       // the vertex as a fraction of the window: u along the dock edge, w toward it
       let u, w;
       switch (this._position) {
@@ -105,8 +112,8 @@ export const GenieEffect = GObject.registerClass(
       const a = lerp(lerp(W.a0, T.a0, s), lerp(W.a1, T.a1, s), u);
 
       const [sx, sy] = this._frame.from(a, b);
-      v.x = sx - this._source.x;
-      v.y = sy - this._source.y;
+      v.x = (sx - this._source.x) * propX;
+      v.y = (sy - this._source.y) * propY;
     }
 
     vfunc_modify_paint_volume() {
